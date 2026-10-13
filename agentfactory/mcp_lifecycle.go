@@ -44,7 +44,10 @@ func (t *ownedMCPTransport) Connect(ctx context.Context) (mcp.Connection, error)
 	if t.pendingDone == nil {
 		t.pendingDone = make(chan struct{})
 	}
-	ctx, cancel := context.WithCancel(ctx)
+	// The SDK retains this context for SSE's response body. Link cancellation
+	// only while Connect is pending; an established connection belongs to us.
+	connectionCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	stopCallerCancel := context.AfterFunc(ctx, cancel)
 	id := t.nextID
 	t.nextID++
 	if t.cancels == nil {
@@ -54,7 +57,11 @@ func (t *ownedMCPTransport) Connect(ctx context.Context) (mcp.Connection, error)
 	t.mu.Unlock()
 
 	defer t.finishConnect()
-	conn, err := t.Transport.Connect(ctx)
+	conn, err := t.Transport.Connect(connectionCtx)
+	stopCallerCancel()
+	if ctx.Err() != nil {
+		err = errors.Join(err, ctx.Err())
+	}
 	t.mu.Lock()
 	if t.closed || err != nil {
 		closed := t.closed
