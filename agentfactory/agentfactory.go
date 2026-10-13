@@ -108,6 +108,11 @@ func formatValidationError(err validator.FieldError) string {
 // Option configures factory behavior.
 type Option func(*Factory)
 
+// WithAvailabilityIndependentMCP defers ACP startup and bounds lazy native MCP operations.
+func WithAvailabilityIndependentMCP() Option {
+	return func(f *Factory) { f.availabilityIndependentMCP = true }
+}
+
 // WithPermissionHandler configures a default ACP permission callback for all built agents.
 func WithPermissionHandler(handler acpagent.PermissionHandler) Option {
 	return func(f *Factory) {
@@ -131,11 +136,12 @@ type constructor func(ctx context.Context, cfg agentconfig.ResolvedConfig, req B
 
 // Factory is a registry of agent configurations.
 type Factory struct {
-	registry          map[string]agentconfig.Config
-	mcpRegistry       mcpregistry.Reader
-	permissionHandler acpagent.PermissionHandler
-	stderrWriter      io.Writer
-	executablePath    string
+	availabilityIndependentMCP bool
+	registry                   map[string]agentconfig.Config
+	mcpRegistry                mcpregistry.Reader
+	permissionHandler          acpagent.PermissionHandler
+	stderrWriter               io.Writer
+	executablePath             string
 }
 
 // New creates a new Factory from agent configurations and an MCP registry.
@@ -374,7 +380,7 @@ func toRuntimeMCPServers(configs map[string]agentconfig.MCPServerConfig) map[str
 	return runtimeConfigs
 }
 
-func hostedToolsets(requestToolsets []tool.Toolset, resolvedMCP map[string]agentconfig.MCPServerConfig) ([]tool.Toolset, []*ownedMCPTransport, error) {
+func hostedToolsets(requestToolsets []tool.Toolset, resolvedMCP map[string]agentconfig.MCPServerConfig, availabilityIndependent ...bool) ([]tool.Toolset, []*ownedMCPTransport, error) {
 	toolsets := append([]tool.Toolset(nil), requestToolsets...)
 	if len(resolvedMCP) == 0 {
 		return toolsets, nil, nil
@@ -439,6 +445,11 @@ func hostedToolsets(requestToolsets []tool.Toolset, resolvedMCP map[string]agent
 		toolset, err := mcptoolset.New(mcptoolset.Config{Transport: owned})
 		if err != nil {
 			return nil, nil, errors.Join(fmt.Errorf("create mcp toolset %q: %w", id, err), closeMCPTransports(transports))
+		}
+		if len(availabilityIndependent) > 0 && availabilityIndependent[0] {
+			bounded := newBoundedMCPToolset(toolset, mcpSetupTimeout, mcpToolTimeout)
+			owned.operations = bounded
+			toolset = bounded
 		}
 		toolsets = append(toolsets, toolset)
 	}
@@ -654,8 +665,15 @@ var acpConstructor = func(ctx context.Context, cfg agentconfig.ResolvedConfig, r
 		return nil, err
 	}
 
+	setupTimeout := time.Duration(0)
+	if f.availabilityIndependentMCP {
+		setupTimeout = mcpSetupTimeout
+	}
 	return newACPAgent(acpagent.Config{
-		Context:           ctx,
+		Context:            ctx,
+		LazyInitialization: f.availabilityIndependentMCP,
+		SetupTimeout:       setupTimeout,
+
 		Name:              effectiveName(req),
 		Description:       effectiveDescription(req, cfg),
 		SessionConfig:     acpSessionConfigValues(cfg.Model, cfg.ModelConfigID, reasoningEffort, cfg.ReasoningEffortConfigID, cfg.Mode),
@@ -735,7 +753,7 @@ var openAIConstructor = func(ctx context.Context, cfg agentconfig.ResolvedConfig
 		Model:             llmModel,
 		Tools:             append([]tool.Tool(nil), req.Tools...),
 		Toolsets:          req.Toolsets,
-	}, resolvedMCP)
+	}, resolvedMCP, f.availabilityIndependentMCP)
 }
 
 var aistudioConstructor = func(ctx context.Context, cfg agentconfig.ResolvedConfig, req BuildRequest, f *Factory, resolvedMCP map[string]agentconfig.MCPServerConfig) (agent.Agent, error) {
@@ -755,7 +773,7 @@ var aistudioConstructor = func(ctx context.Context, cfg agentconfig.ResolvedConf
 		Model:             llmModel,
 		Tools:             append([]tool.Tool(nil), req.Tools...),
 		Toolsets:          req.Toolsets,
-	}, resolvedMCP)
+	}, resolvedMCP, f.availabilityIndependentMCP)
 }
 
 func hasRequestTools(req BuildRequest) bool {

@@ -21,6 +21,7 @@ const mcpCloseTimeout = 5 * time.Second
 
 type ownedMCPTransport struct {
 	mcp.Transport
+	operations  *boundedMCPToolset
 	mu          sync.Mutex
 	closed      bool
 	pending     int
@@ -99,6 +100,9 @@ func (t *ownedMCPTransport) finishConnect() {
 
 func (t *ownedMCPTransport) Close() error {
 	t.closeOnce.Do(func() {
+		if t.operations != nil {
+			t.operations.stop()
+		}
 		t.mu.Lock()
 		t.closed = true
 		if t.pendingDone == nil {
@@ -128,6 +132,9 @@ func (t *ownedMCPTransport) Close() error {
 		t.mu.Lock()
 		t.closeErr = errors.Join(t.closeErr, t.pendingErr)
 		t.mu.Unlock()
+		if t.operations != nil {
+			t.closeErr = errors.Join(t.closeErr, t.operations.Close())
+		}
 	})
 	return t.closeErr
 }
@@ -152,8 +159,8 @@ func closeMCPTransports(transports []*ownedMCPTransport) error {
 	return err
 }
 
-func buildHostedAgent(cfg hostedagent.Config, resolved map[string]agentconfig.MCPServerConfig) (agent.Agent, error) {
-	toolsets, transports, err := hostedToolsets(cfg.Toolsets, resolved)
+func buildHostedAgent(cfg hostedagent.Config, resolved map[string]agentconfig.MCPServerConfig, availabilityIndependent ...bool) (agent.Agent, error) {
+	toolsets, transports, err := hostedToolsets(cfg.Toolsets, resolved, availabilityIndependent...)
 	if err != nil {
 		return nil, err
 	}

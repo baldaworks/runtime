@@ -217,3 +217,19 @@ task docs:check
 Generated output is written to `.cache/godoc/` and is not committed.
 
 See `AGENTS.md` for repository-specific guidance.
+
+Applications that must start independently of MCP availability can opt into
+`agentfactory.WithAvailabilityIndependentMCP()`. This keeps factory construction
+local, defers ACP process initialization until invocation, and bounds ACP setup
+to 10 seconds. Configured native MCP tool discovery has a 10 second caller budget;
+MCP tool calls have a separate 120 second budget, including reconnect. Earlier
+caller cancellation or deadlines take precedence. A legitimately longer tool
+call can therefore fail.
+
+SDK cancellation cleanup may continue after the caller returns. The runtime
+retains one operation slot per toolset until it drains; later callers wait only
+within their own budgets. Closing the owning agent cancels pending operations
+and retains transport cleanup. These limits apply to MCP work, not model prompts
+or conversation lifetime. External ACP agents remain responsible for their own
+internal MCP timeouts and retries. Consumers without the option retain their
+existing construction behavior.

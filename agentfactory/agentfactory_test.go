@@ -149,6 +149,22 @@ func TestAgentFactoryACPHelperProcess(t *testing.T) {
 			continue
 		}
 
+		if path := os.Getenv("GO_AGENTFACTORY_METHOD_LOG"); path != "" {
+			f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+			if err != nil {
+				os.Exit(2)
+			}
+			_, _ = f.Write(append(append([]byte(nil), scanner.Bytes()...), '\n'))
+			_ = f.Close()
+		}
+		if req.Method == acp.AgentMethodSessionNew {
+			_ = encoder.Encode(map[string]any{"jsonrpc": "2.0", "id": req.ID, "result": map[string]any{"sessionId": "factory-fixture"}})
+			continue
+		}
+		if req.Method == acp.AgentMethodSessionPrompt {
+			_ = encoder.Encode(map[string]any{"jsonrpc": "2.0", "id": req.ID, "result": map[string]any{"stopReason": "end_turn"}})
+			continue
+		}
 		if req.Method == acp.AgentMethodInitialize {
 			_ = encoder.Encode(map[string]any{
 				"jsonrpc": "2.0",
