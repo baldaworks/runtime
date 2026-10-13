@@ -135,25 +135,12 @@ func NewOpenAIModelWithTimeout(apiKey, modelName string, timeout time.Duration) 
 
 // NewOpenAIModelWithOptions creates a model with explicit request options.
 func NewOpenAIModelWithOptions(apiKey, modelName string, opts OpenAIModelOptions) (*OpenAIModel, error) {
-	if strings.TrimSpace(apiKey) == "" {
-		return nil, fmt.Errorf("api_key is required for openai provider")
+	if err := ValidateOpenAIModelOptions(apiKey, modelName, opts); err != nil {
+		return nil, err
 	}
-
-	if strings.TrimSpace(modelName) == "" {
-		return nil, fmt.Errorf("model is required for openai provider")
-	}
-
 	timeout := opts.Timeout
 	if timeout == 0 {
 		timeout = defaultOpenAITimeout
-	}
-	if timeout < 0 {
-		return nil, fmt.Errorf("openai timeout must be positive")
-	}
-	switch opts.ReasoningEffort {
-	case "", "none":
-	default:
-		return nil, fmt.Errorf("openai reasoning_effort currently supports only none")
 	}
 	return &OpenAIModel{
 		name:            modelName,
@@ -161,6 +148,28 @@ func NewOpenAIModelWithOptions(apiKey, modelName string, opts OpenAIModelOptions
 		client:          &http.Client{Timeout: timeout},
 		reasoningEffort: opts.ReasoningEffort,
 	}, nil
+}
+
+// ValidateOpenAIModelOptions checks construction parameters without starting a
+// provider, opening MCP connections, or issuing model requests.
+func ValidateOpenAIModelOptions(apiKey, modelName string, opts OpenAIModelOptions) error {
+	if strings.TrimSpace(apiKey) == "" {
+		return fmt.Errorf("api_key is required for openai provider")
+	}
+
+	if strings.TrimSpace(modelName) == "" {
+		return fmt.Errorf("model is required for openai provider")
+	}
+
+	if opts.Timeout < 0 {
+		return fmt.Errorf("openai timeout must be positive")
+	}
+	switch opts.ReasoningEffort {
+	case "", "none":
+	default:
+		return fmt.Errorf("openai reasoning_effort currently supports only none")
+	}
+	return nil
 }
 
 // Name returns the configured OpenAI model identifier.

@@ -126,6 +126,20 @@ func main() {
 }
 ```
 
+`Factory.ValidateAgent` checks the selected provider schema and required hosted model parameters without starting providers or acquiring MCP connections. Hosted model constructors reuse these parameter checks; AI Studio credentials retain the client SDK environment defaults.
+
+Factory-built hosted agents with configured MCP servers implement `io.Closer`.
+Close them at the owning runtime/session boundary to release their lazily opened
+MCP connections. Closing is idempotent, prevents reconnection, cancels pending
+connection work, and reports cleanup errors or a bounded pending-work timeout.
+MCP subprocess termination uses the SDK's bounded stdin/signal/kill sequence;
+HTTP session-deletion requests have a five-second deadline without imposing a
+timeout on ordinary tool calls or SSE streams. Caller-supplied `BuildRequest.Toolsets`
+remain caller-owned. Hosted live/node capabilities and public config stay intact.
+Pool shutdown closes all members it created, including failed members retained
+across retries, and fences pending creation. A constructor that ignores cancellation
+returns a shutdown timeout; its late result remains registered for cleanup.
+
 For `codex_acp`, `bridge_version` accepts an npm version or dist-tag for
 the canonical [`codex-acp`](https://github.com/baldaworks/codex-acp) package;
 empty defaults to the tested `1.10.1` release. The configuration field keeps
@@ -203,3 +217,19 @@ task docs:check
 Generated output is written to `.cache/godoc/` and is not committed.
 
 See `AGENTS.md` for repository-specific guidance.
+
+Applications that must start independently of MCP availability can opt into
+`agentfactory.WithAvailabilityIndependentMCP()`. This keeps factory construction
+local, defers ACP process initialization until invocation, and bounds ACP setup
+to 10 seconds. Configured native MCP tool discovery has a 10 second caller budget;
+MCP tool calls have a separate 120 second budget, including reconnect. Earlier
+caller cancellation or deadlines take precedence. A legitimately longer tool
+call can therefore fail.
+
+SDK cancellation cleanup may continue after the caller returns. The runtime
+retains one operation slot per toolset until it drains; later callers wait only
+within their own budgets. Closing the owning agent cancels pending operations
+and retains transport cleanup. These limits apply to MCP work, not model prompts
+or conversation lifetime. External ACP agents remain responsible for their own
+internal MCP timeouts and retries. Consumers without the option retain their
+existing construction behavior.

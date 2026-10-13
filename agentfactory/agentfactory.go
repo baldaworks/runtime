@@ -2,6 +2,7 @@ package agentfactory
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -107,6 +108,11 @@ func formatValidationError(err validator.FieldError) string {
 // Option configures factory behavior.
 type Option func(*Factory)
 
+// WithAvailabilityIndependentMCP defers ACP startup and bounds lazy native MCP operations.
+func WithAvailabilityIndependentMCP() Option {
+	return func(f *Factory) { f.availabilityIndependentMCP = true }
+}
+
 // WithPermissionHandler configures a default ACP permission callback for all built agents.
 func WithPermissionHandler(handler acpagent.PermissionHandler) Option {
 	return func(f *Factory) {
@@ -130,11 +136,12 @@ type constructor func(ctx context.Context, cfg agentconfig.ResolvedConfig, req B
 
 // Factory is a registry of agent configurations.
 type Factory struct {
-	registry          map[string]agentconfig.Config
-	mcpRegistry       mcpregistry.Reader
-	permissionHandler acpagent.PermissionHandler
-	stderrWriter      io.Writer
-	executablePath    string
+	availabilityIndependentMCP bool
+	registry                   map[string]agentconfig.Config
+	mcpRegistry                mcpregistry.Reader
+	permissionHandler          acpagent.PermissionHandler
+	stderrWriter               io.Writer
+	executablePath             string
 }
 
 // New creates a new Factory from agent configurations and an MCP registry.
@@ -168,10 +175,14 @@ func (f *Factory) GetAgentConfig(agentID string) (agentconfig.Config, error) {
 	return cfg, nil
 }
 
-// ValidateAgent checks if an agent with agentID can be built.
+// ValidateAgent checks the provider schema and required construction parameters.
+// It does not start providers, acquire MCP connections, or issue model requests.
 func (f *Factory) ValidateAgent(agentID string) error {
 	cfg, err := f.GetAgentConfig(agentID)
 	if err != nil {
+		return err
+	}
+	if err := cfg.Validate(); err != nil {
 		return err
 	}
 	resolvedCfg, err := agentconfig.NormalizeConfig(cfg, f.executablePath)
@@ -181,7 +192,16 @@ func (f *Factory) ValidateAgent(agentID string) error {
 	if _, ok := constructors[resolvedCfg.Type]; !ok {
 		return fmt.Errorf("agent type %q is not supported", resolvedCfg.Type)
 	}
-	return nil
+	switch resolvedCfg.Type {
+	case agentconfig.AgentTypeOpenAI:
+		return hostedagent.ValidateOpenAIModelOptions(resolvedCfg.APIKey, resolvedCfg.Model, hostedagent.OpenAIModelOptions{
+			Timeout: resolvedCfg.Timeout, ReasoningEffort: resolvedCfg.ReasoningEffort,
+		})
+	case agentconfig.AgentTypeAIStudio:
+		return hostedagent.ValidateAIStudioModel(resolvedCfg.Model)
+	default:
+		return nil
+	}
 }
 
 // Build creates an agent.Agent instance from request.
@@ -360,10 +380,10 @@ func toRuntimeMCPServers(configs map[string]agentconfig.MCPServerConfig) map[str
 	return runtimeConfigs
 }
 
-func hostedToolsets(requestToolsets []tool.Toolset, resolvedMCP map[string]agentconfig.MCPServerConfig) ([]tool.Toolset, error) {
+func hostedToolsets(requestToolsets []tool.Toolset, resolvedMCP map[string]agentconfig.MCPServerConfig, availabilityIndependent ...bool) ([]tool.Toolset, []*ownedMCPTransport, error) {
 	toolsets := append([]tool.Toolset(nil), requestToolsets...)
 	if len(resolvedMCP) == 0 {
-		return toolsets, nil
+		return toolsets, nil, nil
 	}
 
 	ids := make([]string, 0, len(resolvedMCP))
@@ -399,7 +419,7 @@ func hostedToolsets(requestToolsets []tool.Toolset, resolvedMCP map[string]agent
 			continue
 		}
 		if resolvedMCP[id].DedupPreferred && resolvedMCP[keeper].DedupPreferred {
-			return nil, fmt.Errorf("mcp dedup key %q has multiple preferred configs: %q and %q", key, keeper, id)
+			return nil, nil, fmt.Errorf("mcp dedup key %q has multiple preferred configs: %q and %q", key, keeper, id)
 		}
 		// A preferred entry replaces the current keeper; a preferred keeper is
 		// never displaced.
@@ -411,21 +431,29 @@ func hostedToolsets(requestToolsets []tool.Toolset, resolvedMCP map[string]agent
 		skip[id] = true
 	}
 
+	var transports []*ownedMCPTransport
 	for _, id := range ids {
 		if skip[id] {
 			continue
 		}
 		transport, err := mcpTransportFactory(resolvedMCP[id])
 		if err != nil {
-			return nil, fmt.Errorf("create mcp transport %q: %w", id, err)
+			return nil, nil, errors.Join(fmt.Errorf("create mcp transport %q: %w", id, err), closeMCPTransports(transports))
 		}
-		toolset, err := mcptoolset.New(mcptoolset.Config{Transport: transport})
+		owned := &ownedMCPTransport{Transport: transport}
+		transports = append(transports, owned)
+		toolset, err := mcptoolset.New(mcptoolset.Config{Transport: owned})
 		if err != nil {
-			return nil, fmt.Errorf("create mcp toolset %q: %w", id, err)
+			return nil, nil, errors.Join(fmt.Errorf("create mcp toolset %q: %w", id, err), closeMCPTransports(transports))
+		}
+		if len(availabilityIndependent) > 0 && availabilityIndependent[0] {
+			bounded := newBoundedMCPToolset(toolset, mcpSetupTimeout, mcpToolTimeout)
+			owned.operations = bounded
+			toolset = bounded
 		}
 		toolsets = append(toolsets, toolset)
 	}
-	return toolsets, nil
+	return toolsets, transports, nil
 }
 
 // mcpTransportFactory builds the transport for one resolved MCP server config.
@@ -477,13 +505,16 @@ func stringMapEnv(env map[string]string) []string {
 }
 
 func httpClientWithHeaders(headers map[string]string) *http.Client {
+	client := &http.Client{}
 	if len(headers) == 0 {
-		return nil
+		*client = *http.DefaultClient
 	}
-	return &http.Client{Transport: staticHeaderRoundTripper{
-		base:    http.DefaultTransport,
-		headers: cloneStringMap(headers),
-	}}
+	base := client.Transport
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	client.Transport = staticHeaderRoundTripper{base: base, headers: cloneStringMap(headers)}
+	return client
 }
 
 type staticHeaderRoundTripper struct {
@@ -500,7 +531,21 @@ func (t staticHeaderRoundTripper) RoundTrip(req *http.Request) (*http.Response, 
 	if base == nil {
 		base = http.DefaultTransport
 	}
-	return base.RoundTrip(clone)
+	if req.Method != http.MethodDelete {
+		return base.RoundTrip(clone)
+	}
+	// Older SDKs issue shutdown DELETE with a detached context and no timeout.
+	// Bound only session deletion; ordinary calls and SSE remain unrestricted.
+	ctx, cancel := context.WithTimeout(clone.Context(), mcpCloseTimeout)
+	defer cancel()
+	response, err := base.RoundTrip(clone.Clone(ctx))
+	if response != nil && response.Body != nil {
+		// The SDK does not consume the DELETE response body. Release it before
+		// cancelling the request so it cannot retain a connection after shutdown.
+		err = errors.Join(err, response.Body.Close())
+		response.Body = http.NoBody
+	}
+	return response, err
 }
 
 func toRuntimeMCPServerType(serverType agentconfig.MCPServerType) acpagent.MCPServerType {
@@ -620,8 +665,15 @@ var acpConstructor = func(ctx context.Context, cfg agentconfig.ResolvedConfig, r
 		return nil, err
 	}
 
+	setupTimeout := time.Duration(0)
+	if f.availabilityIndependentMCP {
+		setupTimeout = mcpSetupTimeout
+	}
 	return newACPAgent(acpagent.Config{
-		Context:           ctx,
+		Context:            ctx,
+		LazyInitialization: f.availabilityIndependentMCP,
+		SetupTimeout:       setupTimeout,
+
 		Name:              effectiveName(req),
 		Description:       effectiveDescription(req, cfg),
 		SessionConfig:     acpSessionConfigValues(cfg.Model, cfg.ModelConfigID, reasoningEffort, cfg.ReasoningEffortConfigID, cfg.Mode),
@@ -693,20 +745,15 @@ var openAIConstructor = func(ctx context.Context, cfg agentconfig.ResolvedConfig
 		return nil, err
 	}
 
-	toolsets, err := hostedToolsets(req.Toolsets, resolvedMCP)
-	if err != nil {
-		return nil, err
-	}
-
-	return newHostedAgent(hostedagent.Config{
+	return buildHostedAgent(hostedagent.Config{
 		Name:              effectiveName(req),
 		Description:       effectiveDescription(req, cfg),
 		Instruction:       effectiveInstruction(req, cfg),
 		GlobalInstruction: effectiveGlobalInstruction(req),
 		Model:             llmModel,
 		Tools:             append([]tool.Tool(nil), req.Tools...),
-		Toolsets:          toolsets,
-	})
+		Toolsets:          req.Toolsets,
+	}, resolvedMCP, f.availabilityIndependentMCP)
 }
 
 var aistudioConstructor = func(ctx context.Context, cfg agentconfig.ResolvedConfig, req BuildRequest, f *Factory, resolvedMCP map[string]agentconfig.MCPServerConfig) (agent.Agent, error) {
@@ -718,20 +765,15 @@ var aistudioConstructor = func(ctx context.Context, cfg agentconfig.ResolvedConf
 		return nil, err
 	}
 
-	toolsets, err := hostedToolsets(req.Toolsets, resolvedMCP)
-	if err != nil {
-		return nil, err
-	}
-
-	return newHostedAgent(hostedagent.Config{
+	return buildHostedAgent(hostedagent.Config{
 		Name:              effectiveName(req),
 		Description:       effectiveDescription(req, cfg),
 		Instruction:       effectiveInstruction(req, cfg),
 		GlobalInstruction: effectiveGlobalInstruction(req),
 		Model:             llmModel,
 		Tools:             append([]tool.Tool(nil), req.Tools...),
-		Toolsets:          toolsets,
-	})
+		Toolsets:          req.Toolsets,
+	}, resolvedMCP, f.availabilityIndependentMCP)
 }
 
 func hasRequestTools(req BuildRequest) bool {

@@ -13,8 +13,8 @@ import (
 // NewAIStudioModel creates an ADK-compatible Gemini model backed by Google AI
 // Studio.
 func NewAIStudioModel(ctx context.Context, apiKey, modelName string) (model.LLM, error) {
-	if strings.TrimSpace(modelName) == "" {
-		return nil, fmt.Errorf("model is required for aistudio provider")
+	if err := ValidateAIStudioModel(modelName); err != nil {
+		return nil, err
 	}
 
 	var cfg *genai.ClientConfig
@@ -28,4 +28,13 @@ func NewAIStudioModel(ctx context.Context, apiKey, modelName string) (model.LLM,
 	}
 
 	return llmModel, nil
+}
+
+// ValidateAIStudioModel checks the required model parameter without creating a
+// client. Credentials continue to use the client SDK's environment defaults.
+func ValidateAIStudioModel(modelName string) error {
+	if strings.TrimSpace(modelName) == "" {
+		return fmt.Errorf("model is required for aistudio provider")
+	}
+	return nil
 }

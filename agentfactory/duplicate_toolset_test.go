@@ -63,7 +63,7 @@ func TestHostedToolsetsCollapsesScopedEndpointDuplicate(t *testing.T) {
 
 	endpoints := recordTransportEndpoints(t)
 
-	toolsets, err := hostedToolsets(nil, resolved)
+	toolsets, _, err := hostedToolsets(nil, resolved)
 	if err != nil {
 		t.Fatalf("hostedToolsets: %v", err)
 	}
@@ -101,7 +101,7 @@ func TestDistinctQueryParamsNeverCollapse(t *testing.T) {
 
 	endpoints := recordTransportEndpoints(t)
 
-	toolsets, err := hostedToolsets(nil, resolved)
+	toolsets, _, err := hostedToolsets(nil, resolved)
 	if err != nil {
 		t.Fatalf("hostedToolsets: %v", err)
 	}
@@ -139,7 +139,7 @@ func TestDistinctHeadersNeverCollapse(t *testing.T) {
 
 	endpoints := recordTransportEndpoints(t)
 
-	toolsets, err := hostedToolsets(nil, resolved)
+	toolsets, _, err := hostedToolsets(nil, resolved)
 	if err != nil {
 		t.Fatalf("hostedToolsets: %v", err)
 	}
@@ -163,7 +163,7 @@ func TestSameDedupKeyCollapsesThreeEntries(t *testing.T) {
 
 	endpoints := recordTransportEndpoints(t)
 
-	toolsets, err := hostedToolsets(nil, resolved)
+	toolsets, _, err := hostedToolsets(nil, resolved)
 	if err != nil {
 		t.Fatalf("hostedToolsets: %v", err)
 	}
@@ -206,7 +206,7 @@ func TestDedupPreferredDecidesPlaceholderWinner(t *testing.T) {
 
 	endpoints := recordTransportEndpoints(t)
 
-	toolsets, err := hostedToolsets(nil, resolved)
+	toolsets, _, err := hostedToolsets(nil, resolved)
 	if err != nil {
 		t.Fatalf("hostedToolsets: %v", err)
 	}
@@ -230,7 +230,7 @@ func TestDedupWithoutPreferenceIsLexicographicallySmallest(t *testing.T) {
 
 	endpoints := recordTransportEndpoints(t)
 
-	toolsets, err := hostedToolsets(nil, resolved)
+	toolsets, _, err := hostedToolsets(nil, resolved)
 	if err != nil {
 		t.Fatalf("hostedToolsets: %v", err)
 	}
@@ -252,7 +252,7 @@ func TestEmptyDedupKeyNeverCollapses(t *testing.T) {
 
 	endpoints := recordTransportEndpoints(t)
 
-	toolsets, err := hostedToolsets(nil, resolved)
+	toolsets, _, err := hostedToolsets(nil, resolved)
 	if err != nil {
 		t.Fatalf("hostedToolsets: %v", err)
 	}
@@ -282,7 +282,7 @@ func TestDedupKeyIsOpaque(t *testing.T) {
 	}
 
 	endpoints := recordTransportEndpoints(t)
-	toolsets, err := hostedToolsets(nil, resolved)
+	toolsets, _, err := hostedToolsets(nil, resolved)
 	if err != nil {
 		t.Fatalf("hostedToolsets: %v", err)
 	}
@@ -314,7 +314,7 @@ func TestHostedToolsetsRejectsMultipleDedupPreferredConfigs(t *testing.T) {
 		},
 	}
 
-	if _, err := hostedToolsets(nil, resolved); err == nil {
+	if _, _, err := hostedToolsets(nil, resolved); err == nil {
 		t.Fatal("expected multiple preferred configs to be rejected")
 	}
 }
@@ -354,7 +354,7 @@ func TestHostedToolsetsKeepsDistinctEndpoints(t *testing.T) {
 		},
 	}
 
-	toolsets, err := hostedToolsets(nil, resolved)
+	toolsets, _, err := hostedToolsets(nil, resolved)
 	if err != nil {
 		t.Fatalf("hostedToolsets: %v", err)
 	}

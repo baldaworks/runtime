@@ -1,0 +1,34 @@
+name: MCP owned lifecycle
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/mcp-lifecycle.yml'
+      - 'agentfactory/**'
+      - 'poolagent/**'
+      - 'go.mod'
+      - 'go.sum'
+  pull_request:
+    paths:
+      - '.github/workflows/mcp-lifecycle.yml'
+      - 'agentfactory/**'
+      - 'poolagent/**'
+      - 'go.mod'
+      - 'go.sum'
+permissions:
+  contents: read
+jobs:
+  native-lifecycle:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: Actual hosted subprocess, transport and pool shutdown
+        run: go test -race -count=1 ./agentfactory ./poolagent -run 'Test(HostedMCP|MCP|PoolClose|PoolRetry)'
