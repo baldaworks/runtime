@@ -97,16 +97,40 @@ type retryMember struct {
 	agent.Agent
 	closes atomic.Int32
 	fail   bool
+	cancel context.CancelFunc
 }
 
 func (m *retryMember) Close() error { m.closes.Add(1); return nil }
 func (m *retryMember) Run(agent.InvocationContext) iter.Seq2[*session.Event, error] {
 	return func(yield func(*session.Event, error) bool) {
 		if m.fail {
+			if m.cancel != nil {
+				m.cancel()
+			}
 			yield(nil, errors.New("run failed"))
 		} else {
 			yield(nil, nil)
 		}
+	}
+}
+
+func TestPoolRetryStopsWhenInvocationCanceled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	first, second := &retryMember{fail: true, cancel: cancel}, &retryMember{}
+	creator := &retryCreator{members: []*retryMember{first, second}}
+	pool := &PoolAgent{executor: NewPoolExecutor("pool", []MemberConfig{{Name: "member"}}, creator, AgentRequest{})}
+
+	errorsSeen := 0
+	for _, err := range pool.run(retryContext{Context: ctx}) {
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("pool run error = %v, want context cancellation", err)
+		}
+		errorsSeen++
+	}
+	if errorsSeen != 1 || creator.calls != 1 {
+		t.Fatalf("canceled run returned %d errors and created %d members, want one error and one member", errorsSeen, creator.calls)
 	}
 }
 
