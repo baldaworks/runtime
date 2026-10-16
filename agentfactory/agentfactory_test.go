@@ -157,6 +157,18 @@ func TestAgentFactoryACPHelperProcess(t *testing.T) {
 			_, _ = f.Write(append(append([]byte(nil), scanner.Bytes()...), '\n'))
 			_ = f.Close()
 		}
+		if req.Method == os.Getenv("GO_AGENTFACTORY_STALLED_METHOD") {
+			continue
+		}
+		if req.Method == acp.AgentMethodInitialize {
+			if value := os.Getenv("GO_AGENTFACTORY_INITIALIZE_DELAY"); value != "" {
+				delay, err := time.ParseDuration(value)
+				if err != nil {
+					os.Exit(2)
+				}
+				time.Sleep(delay)
+			}
+		}
 		if req.Method == acp.AgentMethodSessionNew {
 			_ = encoder.Encode(map[string]any{"jsonrpc": "2.0", "id": req.ID, "result": map[string]any{"sessionId": "factory-fixture"}})
 			continue
