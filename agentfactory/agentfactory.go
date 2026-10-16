@@ -113,6 +113,16 @@ func WithAvailabilityIndependentMCP() Option {
 	return func(f *Factory) { f.availabilityIndependentMCP = true }
 }
 
+// WithACPInitializeTimeout sets the ACP process launch and initialize budget.
+// A positive duration overrides initialization only; session attachment and MCP
+// budgets are unchanged. Zero preserves the existing behavior: initialization
+// inherits SetupTimeout (10s with WithAvailabilityIndependentMCP, otherwise no
+// additional deadline). Negative durations are rejected by Build. Hosted
+// providers are unaffected by a valid option.
+func WithACPInitializeTimeout(timeout time.Duration) Option {
+	return func(f *Factory) { f.acpInitializeTimeout = timeout }
+}
+
 // WithPermissionHandler configures a default ACP permission callback for all built agents.
 func WithPermissionHandler(handler acpagent.PermissionHandler) Option {
 	return func(f *Factory) {
@@ -137,6 +147,7 @@ type constructor func(ctx context.Context, cfg agentconfig.ResolvedConfig, req B
 // Factory is a registry of agent configurations.
 type Factory struct {
 	availabilityIndependentMCP bool
+	acpInitializeTimeout       time.Duration
 	registry                   map[string]agentconfig.Config
 	mcpRegistry                mcpregistry.Reader
 	permissionHandler          acpagent.PermissionHandler
@@ -206,6 +217,9 @@ func (f *Factory) ValidateAgent(agentID string) error {
 
 // Build creates an agent.Agent instance from request.
 func (f *Factory) Build(ctx context.Context, req BuildRequest) (agent.Agent, error) {
+	if f.acpInitializeTimeout < 0 {
+		return nil, fmt.Errorf("acp initialize timeout must not be negative")
+	}
 	if err := req.Validate(); err != nil {
 		return nil, err
 	}
@@ -673,6 +687,7 @@ var acpConstructor = func(ctx context.Context, cfg agentconfig.ResolvedConfig, r
 		Context:            ctx,
 		LazyInitialization: f.availabilityIndependentMCP,
 		SetupTimeout:       setupTimeout,
+		InitializeTimeout:  f.acpInitializeTimeout,
 
 		Name:              effectiveName(req),
 		Description:       effectiveDescription(req, cfg),

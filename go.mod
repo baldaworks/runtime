@@ -7,7 +7,7 @@ require (
 	github.com/go-playground/validator/v10 v10.30.2
 	github.com/go-viper/mapstructure/v2 v2.5.0
 	github.com/modelcontextprotocol/go-sdk v1.7.0
-	github.com/normahq/go-adk-acpagent/v2 v2.2.7-0.20261013114432-a61ad0b36205
+	github.com/normahq/go-adk-acpagent/v2 v2.4.0
 	github.com/rs/zerolog v1.35.1
 	github.com/spf13/viper v1.21.0
 	github.com/stretchr/testify v1.12.1

@@ -220,8 +220,10 @@ See `AGENTS.md` for repository-specific guidance.
 
 Applications that must start independently of MCP availability can opt into
 `agentfactory.WithAvailabilityIndependentMCP()`. This keeps factory construction
-local, defers ACP process initialization until invocation, and bounds ACP setup
-to 10 seconds. Configured native MCP tool discovery has a 10 second caller budget;
+local, defers ACP process initialization until invocation, and bounds ACP session
+attachment (`session/new` and `session/resume`) to 10 seconds. Without an initialize override,
+ACP process launch and initialization inherit that same 10-second budget.
+Configured native MCP tool discovery has a 10 second caller budget;
 MCP tool calls have a separate 120 second budget, including reconnect. Earlier
 caller cancellation or deadlines take precedence. A legitimately longer tool
 call can therefore fail.
@@ -233,3 +235,21 @@ and retains transport cleanup. These limits apply to MCP work, not model prompts
 or conversation lifetime. External ACP agents remain responsible for their own
 internal MCP timeouts and retries. Consumers without the option retain their
 existing construction behavior.
+
+Use `agentfactory.WithACPInitializeTimeout(60 * time.Second)` to give ACP process
+launch and the initialize handshake a separate budget. For example, pass both
+`agentfactory.WithAvailabilityIndependentMCP()` and
+`agentfactory.WithACPInitializeTimeout(60 * time.Second)` to `agentfactory.New`
+to retain invocation-lazy startup and 10-second session attachment while allowing
+slower cold initialization. This option also works with eager ACP construction
+and with ACP members created through a pool. Hosted providers are unaffected.
+
+A positive initialize timeout overrides initialization only. Zero or omission
+preserves existing factory behavior: initialize inherits the attachment budget
+(10 seconds with availability-independent MCP, otherwise no extra deadline).
+Negative values fail `Factory.Build`. Runtime does not introduce a new global
+initialize default. Earlier caller deadlines, cancellation, and owning-agent
+shutdown still take precedence. The startup budget does not limit prompts or the
+healthy process lifetime; failed startup retains ACP-owned bounded cleanup,
+which may add its separate cleanup duration. Native MCP discovery, tool-call,
+and reconnect budgets remain unchanged.
