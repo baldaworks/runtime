@@ -86,6 +86,11 @@ type ACPConfig struct {
 	BridgeVersion string `json:"bridge_version,omitempty" yaml:"bridge_version,omitempty" mapstructure:"bridge_version" validate:"omitempty,notblank"`
 	// RegistryID selects the agent identifier within the ACP Registry.
 	RegistryID string `json:"registry_id,omitempty" yaml:"registry_id,omitempty" mapstructure:"registry_id" validate:"omitempty,notblank"`
+	// InheritEnv controls whether the ACP subprocess starts from the runtime
+	// process environment. Nil defaults to true.
+	InheritEnv *bool `json:"inherit_env,omitempty" yaml:"inherit_env,omitempty" mapstructure:"inherit_env"`
+	// Env overlays exact environment variables for the ACP subprocess.
+	Env map[string]string `json:"env,omitempty" yaml:"env,omitempty" mapstructure:"env"`
 }
 
 const (
@@ -132,7 +137,7 @@ type PoolConfig struct {
 //	  ...type-specific config...
 type Config struct {
 	// Type selects the runtime backend implementation.
-	Type string `json:"type"                           yaml:"type"                           mapstructure:"type"                validate:"required,oneof=generic_acp gemini_acp codex_acp opencode_acp copilot_acp claude_code_acp claude_acp grok_acp registry_acp agy_acp antigravity_acp openai aistudio pool,agent_blocks"`
+	Type string `json:"type"                           yaml:"type"                           mapstructure:"type"                validate:"required,agent_type,agent_blocks"`
 	// MCPServers lists MCP server IDs resolved by higher-level registries.
 	MCPServers []string `json:"mcp_servers,omitempty"          yaml:"mcp_servers,omitempty"          mapstructure:"mcp_servers"         validate:"omitempty,dive,notblank"`
 	// SystemInstructions defines provider-level instructions applied by default.
@@ -168,6 +173,10 @@ type Config struct {
 
 // ResolvedConfig is a runtime-ready agent configuration produced from Config normalization.
 type ResolvedConfig struct {
+	// ConfiguredType is the provider type exactly as selected in configuration.
+	ConfiguredType string
+	// DriverType is the canonical provider driver type after alias resolution.
+	DriverType string
 	// Type is the normalized runtime backend type.
 	Type string
 	// MCPServers are the resolved MCP server IDs referenced by the runtime.
@@ -183,6 +192,10 @@ type ResolvedConfig struct {
 
 	// Command is the runtime command argv for ACP-backed agents.
 	Command []string
+	// Environment is the validated ACP process environment policy.
+	Environment EnvironmentPolicy
+	// RegistryID is the normalized external ACP Registry identifier.
+	RegistryID string
 	// APIKey is the resolved hosted-provider credential.
 	APIKey string
 	// Model is the resolved runtime model identifier.
@@ -251,6 +264,7 @@ func newConfigValidator() *validator.Validate {
 		return name
 	})
 	_ = v.RegisterValidation("notblank", validateNotBlank)
+	_ = v.RegisterValidation("agent_type", validateAgentType)
 	_ = v.RegisterValidation("agent_blocks", validateAgentBlocks)
 	_ = v.RegisterValidation("mcp_requirements", validateMCPRequirements)
 	return v
@@ -294,6 +308,8 @@ func formatValidationError(err validator.FieldError) string {
 		return field + " is required"
 	case "oneof":
 		return field + " must be one of: " + err.Param()
+	case "agent_type":
+		return field + " must be one of: " + strings.Join(SupportedAgentTypes(), " ")
 	case "min":
 		return field + " must be at least " + err.Param()
 	case "notblank":
@@ -305,6 +321,11 @@ func formatValidationError(err validator.FieldError) string {
 	default:
 		return field + " failed validation rule " + err.Tag()
 	}
+}
+
+func validateAgentType(fl validator.FieldLevel) bool {
+	_, ok := builtinDriverRegistry.lookup(strings.TrimSpace(fl.Field().String()))
+	return ok
 }
 
 const (
@@ -341,46 +362,25 @@ const (
 
 // SupportedAgentTypes returns all supported agent types.
 func SupportedAgentTypes() []string {
-	return []string{
-		AgentTypeGenericACP,
-		AgentTypeCodexACP,
-		AgentTypeOpenCodeACP,
-		AgentTypeCopilotACP,
-		AgentTypeClaudeCodeACP,
-		AgentTypeClaudeACP,
-		AgentTypeGrokACP,
-		AgentTypeRegistryACP,
-		AgentTypeAgyACP,
-		AgentTypeAntigravityACP,
-		AgentTypeOpenAI,
-		AgentTypeAIStudio,
-		AgentTypePool,
-	}
+	return builtinDriverRegistry.supportedTypes()
 }
 
 // IsValidAgentType reports whether the given type is a valid agent type.
 func IsValidAgentType(agentType string) bool {
-	for _, t := range SupportedAgentTypes() {
-		if t == agentType {
-			return true
-		}
-	}
-	return false
+	registration, ok := builtinDriverRegistry.lookup(agentType)
+	return ok && !registration.descriptor.Deprecated
 }
 
 // IsPoolType reports whether an agent type is a pool.
 func IsPoolType(agentType string) bool {
-	return canonicalAgentType(agentType) == AgentTypePool
+	driver, ok := BuiltinDriverRegistry().Lookup(agentType)
+	return ok && driver.Class == DriverClassPool
 }
 
 // IsACPType reports whether an agent type uses the ACP runtime.
 func IsACPType(agentType string) bool {
-	switch canonicalAgentType(agentType) {
-	case AgentTypeGenericACP, AgentTypeOpenCodeACP, AgentTypeCodexACP, AgentTypeCopilotACP, AgentTypeClaudeCodeACP, AgentTypeGrokACP, AgentTypeRegistryACP, AgentTypeAgyACP:
-		return true
-	default:
-		return false
-	}
+	driver, ok := BuiltinDriverRegistry().Lookup(agentType)
+	return ok && driver.Class == DriverClassACP && !driver.Deprecated
 }
 
 // IsPlannerSupportedType reports whether planner mode supports the agent type.
@@ -460,155 +460,39 @@ func validateAgentBlocks(fl validator.FieldLevel) bool {
 	if !ok {
 		return false
 	}
-	present := 0
-	if cfg.GenericACP != nil {
-		present++
+	registration, ok := builtinDriverRegistry.lookup(cfg.Type)
+	if !ok {
+		return false
 	}
-	if cfg.GeminiACP != nil {
-		present++
-	}
-	if cfg.CodexACP != nil {
-		present++
-	}
-	if cfg.OpenCodeACP != nil {
-		present++
-	}
-	if cfg.CopilotACP != nil {
-		present++
-	}
-	if cfg.ClaudeCodeACP != nil {
-		present++
-	}
-	if cfg.GrokACP != nil {
-		present++
-	}
-	if cfg.RegistryACP != nil {
-		present++
-	}
-	if cfg.AgyACP != nil {
-		present++
-	}
-	if cfg.AntigravityACP != nil {
-		present++
-	}
-	if cfg.OpenAI != nil {
-		present++
-	}
-	if cfg.AIStudio != nil {
-		present++
-	}
-	if cfg.PoolConfig != nil {
-		present++
-	}
-	if present == 0 && strings.TrimSpace(cfg.Type) == AgentTypeCopilotACP {
+	present := configuredBlockNames(cfg)
+	if len(present) == 0 && registration.descriptor.Type == AgentTypeCopilotACP {
 		return true
 	}
-	if present != 1 {
+	if len(present) != 1 {
 		return false
 	}
-
-	switch canonicalAgentType(cfg.Type) {
-	case AgentTypeGenericACP:
-		return cfg.GenericACP != nil && len(cfg.GenericACP.Cmd) > 0
-	case AgentTypeGeminiACP:
-		return cfg.GeminiACP != nil && len(cfg.GeminiACP.Cmd) == 0
-	case AgentTypeCodexACP:
-		return cfg.CodexACP != nil
-	case AgentTypeOpenCodeACP:
-		return cfg.OpenCodeACP != nil
-	case AgentTypeCopilotACP:
-		return cfg.CopilotACP != nil
-	case AgentTypeClaudeCodeACP:
-		return cfg.ClaudeCodeACP != nil
-	case AgentTypeGrokACP:
-		return cfg.GrokACP != nil
-	case AgentTypeRegistryACP:
-		return cfg.RegistryACP != nil
-	case AgentTypeAgyACP:
-		return cfg.AgyACP != nil || cfg.AntigravityACP != nil
-	case AgentTypeClaudeACP:
-		return cfg.ClaudeCodeACP != nil
-	case AgentTypeOpenAI:
-		return cfg.OpenAI != nil
-	case AgentTypeAIStudio:
-		return cfg.AIStudio != nil
-	case AgentTypePool:
-		return cfg.PoolConfig != nil && len(cfg.PoolConfig.Members) > 0
-	default:
-		return false
-	}
+	return registration.blockValid(cfg)
 }
 
 func explainAgentBlocksError(cfg Config) string {
-	typeBlocks := map[string]bool{
-		AgentTypeGenericACP:    cfg.GenericACP != nil,
-		AgentTypeGeminiACP:     cfg.GeminiACP != nil,
-		AgentTypeCodexACP:      cfg.CodexACP != nil,
-		AgentTypeOpenCodeACP:   cfg.OpenCodeACP != nil,
-		AgentTypeCopilotACP:    cfg.CopilotACP != nil,
-		AgentTypeClaudeCodeACP: cfg.ClaudeCodeACP != nil,
-		AgentTypeGrokACP:       cfg.GrokACP != nil,
-		AgentTypeRegistryACP:   cfg.RegistryACP != nil,
-		AgentTypeAgyACP:        cfg.AgyACP != nil || cfg.AntigravityACP != nil,
-		AgentTypeOpenAI:        cfg.OpenAI != nil,
-		AgentTypeAIStudio:      cfg.AIStudio != nil,
-		AgentTypePool:          cfg.PoolConfig != nil,
+	registration, ok := builtinDriverRegistry.lookup(cfg.Type)
+	if !ok {
+		return fmt.Sprintf("unsupported agent type %q", cfg.Type)
 	}
-	selectedCount := 0
-	for _, present := range typeBlocks {
-		if present {
-			selectedCount++
-		}
-	}
-	if selectedCount == 0 && strings.TrimSpace(cfg.Type) == AgentTypeCopilotACP {
+	present := configuredBlockNames(cfg)
+	if len(present) == 0 && registration.descriptor.Type == AgentTypeCopilotACP {
 		return ""
 	}
-	if selectedCount != 1 {
+	if len(present) != 1 {
 		return "exactly one type-specific block must be set"
 	}
 
 	rawTypeName := strings.TrimSpace(cfg.Type)
-	typeName := canonicalAgentType(cfg.Type)
-	if present, ok := typeBlocks[typeName]; ok && !present {
-		return fmt.Sprintf("%s block is required for type %s", typeName, rawTypeName)
+	if !registration.blockPresent(cfg) {
+		return fmt.Sprintf("%s block must be omitted when type is %s", present[0], rawTypeName)
 	}
-	for blockType, present := range typeBlocks {
-		if !present || blockType == typeName {
-			continue
-		}
-		return fmt.Sprintf("%s block must be omitted when type is %s", blockType, rawTypeName)
-	}
-
-	switch typeName {
-	case AgentTypeGenericACP:
-		if cfg.GenericACP == nil || len(cfg.GenericACP.Cmd) == 0 {
-			return fmt.Sprintf("cmd is required for type %s", rawTypeName)
-		}
-	case AgentTypeGeminiACP:
-		if cfg.GeminiACP != nil && len(cfg.GeminiACP.Cmd) > 0 {
-			return fmt.Sprintf("cmd must be omitted for type %s", rawTypeName)
-		}
-	case AgentTypeCodexACP:
-	case AgentTypeOpenCodeACP:
-	case AgentTypeCopilotACP:
-	case AgentTypeClaudeCodeACP:
-	case AgentTypeClaudeACP:
-	case AgentTypeGrokACP:
-	case AgentTypeRegistryACP:
-	case AgentTypeAgyACP:
-	case AgentTypeAntigravityACP:
-	case AgentTypeOpenAI:
-		if cfg.OpenAI == nil {
-			return fmt.Sprintf("openai block is required for type %s", rawTypeName)
-		}
-	case AgentTypeAIStudio:
-		if cfg.AIStudio == nil {
-			return fmt.Sprintf("aistudio block is required for type %s", rawTypeName)
-		}
-	case AgentTypePool:
-		if cfg.PoolConfig == nil || len(cfg.PoolConfig.Members) == 0 {
-			return "pool.members is required for type pool"
-		}
+	if message := registration.blockError(cfg, rawTypeName); message != "" {
+		return message
 	}
 	return "type-specific block configuration is invalid for selected type"
 }
@@ -626,169 +510,20 @@ func explainMCPRequirementsError(cfg MCPServerConfig) string {
 
 // NormalizeConfig canonicalizes aliases and returns a runtime-ready configuration.
 func NormalizeConfig(cfg Config, executablePath string) (ResolvedConfig, error) {
-	_ = executablePath
 	if err := validateAgentConfigSemantics(cfg); err != nil {
 		return ResolvedConfig{}, err
 	}
+	registration, ok := builtinDriverRegistry.lookup(cfg.Type)
+	if !ok {
+		return ResolvedConfig{}, fmt.Errorf("unsupported agent type %q", cfg.Type)
+	}
 	resolved := ResolvedConfig{
+		ConfiguredType:     strings.TrimSpace(cfg.Type),
+		DriverType:         registration.descriptor.Type,
 		MCPServers:         append([]string(nil), cfg.MCPServers...),
 		SystemInstructions: cfg.SystemInstructions,
 	}
-
-	switch canonicalAgentType(cfg.Type) {
-	case AgentTypeGeminiACP:
-		if cfg.GeminiACP == nil {
-			return ResolvedConfig{}, fmt.Errorf("gemini_acp block is required")
-		}
-		return resolveACPConfig(resolved, AgentTypeGenericACP, ACPConfig{
-			Cmd:                     appendGeminiModelFlag([]string{"gemini", "--acp"}, cfg.GeminiACP.Model),
-			ExtraArgs:               append([]string(nil), cfg.GeminiACP.ExtraArgs...),
-			Model:                   cfg.GeminiACP.Model,
-			ModelConfigID:           cfg.GeminiACP.ModelConfigID,
-			ReasoningEffort:         cfg.GeminiACP.ReasoningEffort,
-			ReasoningEffortConfigID: cfg.GeminiACP.ReasoningEffortConfigID,
-			Mode:                    cfg.GeminiACP.Mode,
-		}), nil
-	case AgentTypeOpenCodeACP:
-		if cfg.OpenCodeACP == nil {
-			return ResolvedConfig{}, fmt.Errorf("opencode_acp block is required")
-		}
-		return resolveACPConfig(resolved, AgentTypeGenericACP, ACPConfig{
-			Cmd:                     commandOrDefault(cfg.OpenCodeACP.Cmd, []string{"opencode", "acp"}),
-			ExtraArgs:               append([]string(nil), cfg.OpenCodeACP.ExtraArgs...),
-			Model:                   cfg.OpenCodeACP.Model,
-			ModelConfigID:           cfg.OpenCodeACP.ModelConfigID,
-			ReasoningEffort:         cfg.OpenCodeACP.ReasoningEffort,
-			ReasoningEffortConfigID: cfg.OpenCodeACP.ReasoningEffortConfigID,
-			Mode:                    cfg.OpenCodeACP.Mode,
-		}), nil
-	case AgentTypeCodexACP:
-		if cfg.CodexACP == nil {
-			return ResolvedConfig{}, fmt.Errorf("codex_acp block is required")
-		}
-		return resolveACPConfig(resolved, AgentTypeGenericACP, ACPConfig{
-			Cmd:                     commandOrDefault(cfg.CodexACP.Cmd, []string{npxCommand, npxYesFlag, codexACPPackage(cfg.CodexACP.BridgeVersion)}),
-			ExtraArgs:               append([]string(nil), cfg.CodexACP.ExtraArgs...),
-			Model:                   cfg.CodexACP.Model,
-			ModelConfigID:           cfg.CodexACP.ModelConfigID,
-			ReasoningEffort:         cfg.CodexACP.ReasoningEffort,
-			ReasoningEffortConfigID: cfg.CodexACP.ReasoningEffortConfigID,
-			Mode:                    cfg.CodexACP.Mode,
-		}), nil
-	case AgentTypeCopilotACP:
-		copilotACP := cfg.CopilotACP
-		if copilotACP == nil {
-			copilotACP = &ACPConfig{}
-		}
-		return resolveACPConfig(resolved, AgentTypeGenericACP, ACPConfig{
-			Cmd:                     commandOrDefault(copilotACP.Cmd, []string{"copilot", "--acp", "--stdio"}),
-			ExtraArgs:               append([]string(nil), copilotACP.ExtraArgs...),
-			Model:                   copilotACP.Model,
-			ModelConfigID:           copilotACP.ModelConfigID,
-			ReasoningEffort:         copilotACP.ReasoningEffort,
-			ReasoningEffortConfigID: copilotACP.ReasoningEffortConfigID,
-			Mode:                    copilotACP.Mode,
-		}), nil
-	case AgentTypeClaudeCodeACP, AgentTypeClaudeACP:
-		if cfg.ClaudeCodeACP == nil {
-			return ResolvedConfig{}, fmt.Errorf("claude_code_acp block is required")
-		}
-		return resolveACPConfig(resolved, AgentTypeGenericACP, ACPConfig{
-			Cmd:                     commandOrDefault(cfg.ClaudeCodeACP.Cmd, []string{"npx", "-y", "@zed-industries/claude-code-acp@latest"}),
-			ExtraArgs:               append([]string(nil), cfg.ClaudeCodeACP.ExtraArgs...),
-			Model:                   cfg.ClaudeCodeACP.Model,
-			ModelConfigID:           cfg.ClaudeCodeACP.ModelConfigID,
-			ReasoningEffort:         cfg.ClaudeCodeACP.ReasoningEffort,
-			ReasoningEffortConfigID: cfg.ClaudeCodeACP.ReasoningEffortConfigID,
-			Mode:                    cfg.ClaudeCodeACP.Mode,
-		}), nil
-	case AgentTypeGrokACP:
-		if cfg.GrokACP == nil {
-			return ResolvedConfig{}, fmt.Errorf("grok_acp block is required")
-		}
-		return resolveACPConfig(resolved, AgentTypeGenericACP, ACPConfig{
-			Cmd:                     commandOrDefault(cfg.GrokACP.Cmd, []string{"grok", "agent", "stdio"}),
-			ExtraArgs:               append([]string(nil), cfg.GrokACP.ExtraArgs...),
-			Model:                   cfg.GrokACP.Model,
-			ModelConfigID:           cfg.GrokACP.ModelConfigID,
-			ReasoningEffort:         cfg.GrokACP.ReasoningEffort,
-			ReasoningEffortConfigID: cfg.GrokACP.ReasoningEffortConfigID,
-			Mode:                    cfg.GrokACP.Mode,
-		}), nil
-	case AgentTypeAgyACP, AgentTypeAntigravityACP:
-		spec := cfg.AgyACP
-		if spec == nil {
-			spec = cfg.AntigravityACP
-		}
-		if spec == nil {
-			return ResolvedConfig{}, fmt.Errorf("agy_acp block is required")
-		}
-		return resolveACPConfig(resolved, AgentTypeGenericACP, ACPConfig{
-			Cmd:                     commandOrDefault(spec.Cmd, []string{npxCommand, npxYesFlag, acpRunPackage(spec.BridgeVersion), "run", "antigravity-acp"}),
-			ExtraArgs:               append([]string(nil), spec.ExtraArgs...),
-			Model:                   spec.Model,
-			ModelConfigID:           spec.ModelConfigID,
-			ReasoningEffort:         spec.ReasoningEffort,
-			ReasoningEffortConfigID: spec.ReasoningEffortConfigID,
-			Mode:                    spec.Mode,
-		}), nil
-	case AgentTypeRegistryACP:
-		if cfg.RegistryACP == nil {
-			return ResolvedConfig{}, fmt.Errorf("registry_acp block is required")
-		}
-		if strings.TrimSpace(cfg.RegistryACP.RegistryID) == "" && len(cfg.RegistryACP.Cmd) == 0 {
-			return ResolvedConfig{}, fmt.Errorf("registry_id or cmd is required for type registry_acp")
-		}
-		defaultCmd := []string{npxCommand, npxYesFlag, acpRunPackage(cfg.RegistryACP.BridgeVersion), "run"}
-		if id := strings.TrimSpace(cfg.RegistryACP.RegistryID); id != "" {
-			defaultCmd = append(defaultCmd, id)
-		}
-		return resolveACPConfig(resolved, AgentTypeGenericACP, ACPConfig{
-			Cmd:                     commandOrDefault(cfg.RegistryACP.Cmd, defaultCmd),
-			ExtraArgs:               append([]string(nil), cfg.RegistryACP.ExtraArgs...),
-			Model:                   cfg.RegistryACP.Model,
-			ModelConfigID:           cfg.RegistryACP.ModelConfigID,
-			ReasoningEffort:         cfg.RegistryACP.ReasoningEffort,
-			ReasoningEffortConfigID: cfg.RegistryACP.ReasoningEffortConfigID,
-			Mode:                    cfg.RegistryACP.Mode,
-		}), nil
-	case AgentTypeGenericACP:
-		if cfg.GenericACP == nil {
-			return ResolvedConfig{}, fmt.Errorf("generic_acp block is required")
-		}
-		return resolveACPConfig(resolved, AgentTypeGenericACP, *cfg.GenericACP), nil
-	case AgentTypeOpenAI:
-		if cfg.OpenAI == nil {
-			return ResolvedConfig{}, fmt.Errorf("openai block is required")
-		}
-		resolved.Type = AgentTypeOpenAI
-		resolved.APIKey = cfg.OpenAI.APIKey
-		resolved.Model = cfg.OpenAI.Model
-		timeout, err := parseOpenAITimeout(cfg.OpenAI.Timeout)
-		if err != nil {
-			return ResolvedConfig{}, err
-		}
-		resolved.Timeout = timeout
-		resolved.ReasoningEffort = cfg.OpenAI.ReasoningEffort
-		return resolved, nil
-	case AgentTypeAIStudio:
-		if cfg.AIStudio == nil {
-			return ResolvedConfig{}, fmt.Errorf("aistudio block is required")
-		}
-		resolved.Type = AgentTypeAIStudio
-		resolved.APIKey = cfg.AIStudio.APIKey
-		resolved.Model = cfg.AIStudio.Model
-		return resolved, nil
-	case AgentTypePool:
-		if cfg.PoolConfig == nil {
-			return ResolvedConfig{}, fmt.Errorf("pool block is required")
-		}
-		resolved.Type = AgentTypePool
-		resolved.PoolMembers = append([]string(nil), cfg.PoolConfig.Members...)
-		return resolved, nil
-	default:
-		return ResolvedConfig{}, fmt.Errorf("unsupported agent type %q", cfg.Type)
-	}
+	return registration.resolve(cfg, resolved, executablePath)
 }
 
 // NormalizeConfigs canonicalizes agent configs for a map of named config blocks.
@@ -821,6 +556,8 @@ func NormalizeACPConfigs(cfgs map[string]Config, executablePath string) (map[str
 
 func resolveACPConfig(base ResolvedConfig, resolvedType string, spec ACPConfig) ResolvedConfig {
 	base.Type = resolvedType
+	base.Environment = newEnvironmentPolicy(spec.InheritEnv, spec.Env)
+	base.RegistryID = strings.TrimSpace(spec.RegistryID)
 	base.Model = spec.Model
 	base.ModelConfigID = strings.TrimSpace(spec.ModelConfigID)
 	base.ReasoningEffort = strings.TrimSpace(spec.ReasoningEffort)
@@ -867,59 +604,41 @@ func resolveTemplatedArgs(args []string, model string) []string {
 }
 
 func (c Config) selectedACPBlock() (*ACPConfig, bool) {
-	switch canonicalAgentType(c.Type) {
-	case AgentTypeGenericACP:
-		return c.GenericACP, c.GenericACP != nil
-	case AgentTypeGeminiACP:
-		return c.GeminiACP, c.GeminiACP != nil
-	case AgentTypeCodexACP:
-		return c.CodexACP, c.CodexACP != nil
-	case AgentTypeOpenCodeACP:
-		return c.OpenCodeACP, c.OpenCodeACP != nil
-	case AgentTypeCopilotACP:
-		return c.CopilotACP, c.CopilotACP != nil
-	case AgentTypeClaudeCodeACP, AgentTypeClaudeACP:
-		return c.ClaudeCodeACP, c.ClaudeCodeACP != nil
-	case AgentTypeGrokACP:
-		return c.GrokACP, c.GrokACP != nil
-	case AgentTypeRegistryACP:
-		return c.RegistryACP, c.RegistryACP != nil
-	case AgentTypeAgyACP, AgentTypeAntigravityACP:
-		if c.AgyACP != nil {
-			return c.AgyACP, true
-		}
-		return c.AntigravityACP, c.AntigravityACP != nil
-	default:
+	registration, ok := builtinDriverRegistry.lookup(c.Type)
+	if !ok || registration.acpBlock == nil {
 		return nil, false
 	}
+	block := registration.acpBlock(c)
+	return block, block != nil
 }
 
 func (c Config) selectedLocalAPIBlock() (*LocalAPIConfig, bool) {
-	switch strings.TrimSpace(c.Type) {
-	case AgentTypeOpenAI:
-		return c.OpenAI, c.OpenAI != nil
-	case AgentTypeAIStudio:
-		return c.AIStudio, c.AIStudio != nil
-	default:
+	registration, ok := builtinDriverRegistry.lookup(c.Type)
+	if !ok || registration.localAPIBlock == nil {
 		return nil, false
 	}
+	block := registration.localAPIBlock(c)
+	return block, block != nil
 }
 
 func validateAgentConfigSemantics(cfg Config) error {
-	if canonicalAgentType(cfg.Type) == AgentTypeGeminiACP {
-		return fmt.Errorf("%s is deprecated and no longer supported", AgentTypeGeminiACP)
+	registration, ok := builtinDriverRegistry.lookup(cfg.Type)
+	if !ok {
+		return fmt.Errorf("unsupported agent type %q", cfg.Type)
 	}
-	if canonicalAgentType(cfg.Type) == AgentTypeOpenAI && cfg.OpenAI != nil {
-		if _, err := parseOpenAITimeout(cfg.OpenAI.Timeout); err != nil {
+	if registration.descriptor.Deprecated {
+		return fmt.Errorf("%s is deprecated and no longer supported", registration.descriptor.Type)
+	}
+	if registration.validate != nil {
+		if err := registration.validate(cfg); err != nil {
 			return err
 		}
-		switch cfg.OpenAI.ReasoningEffort {
-		case "", "none":
-		default:
-			return fmt.Errorf("openai.reasoning_effort currently supports only none: %q", cfg.OpenAI.ReasoningEffort)
+	}
+	if registration.acpBlock != nil {
+		if block := registration.acpBlock(cfg); block != nil {
+			return validateEnvironmentConfig(block.Env)
 		}
 	}
-
 	return nil
 }
 
@@ -935,12 +654,9 @@ func parseOpenAITimeout(value string) (time.Duration, error) {
 }
 
 func canonicalAgentType(agentType string) string {
-	switch strings.TrimSpace(agentType) {
-	case AgentTypeClaudeACP:
-		return AgentTypeClaudeCodeACP
-	case AgentTypeAntigravityACP:
-		return AgentTypeAgyACP
-	default:
+	registration, ok := builtinDriverRegistry.lookup(agentType)
+	if !ok {
 		return strings.TrimSpace(agentType)
 	}
+	return registration.descriptor.Type
 }

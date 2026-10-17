@@ -568,6 +568,16 @@ func TestNormalizeConfig(t *testing.T) {
 			if err != nil {
 				t.Fatalf("NormalizeConfig returned error: %v", err)
 			}
+			tt.want.ConfiguredType = strings.TrimSpace(tt.cfg.Type)
+			tt.want.DriverType = canonicalAgentType(tt.cfg.Type)
+			if IsACPType(tt.cfg.Type) {
+				block, _ := tt.cfg.selectedACPBlock()
+				if block == nil {
+					block = &ACPConfig{}
+				}
+				tt.want.Environment = newEnvironmentPolicy(block.InheritEnv, block.Env)
+				tt.want.RegistryID = strings.TrimSpace(block.RegistryID)
+			}
 			if !reflect.DeepEqual(got, tt.want) {
 				t.Fatalf("NormalizeConfig = %#v, want %#v", got, tt.want)
 			}
