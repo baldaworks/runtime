@@ -10,7 +10,7 @@
 //   - sessionstate for canonical runtime session-state keys
 //   - structuredagent for JSON-schema-constrained ADK agent wrappers
 //
-// Use [github.com/normahq/runtime/v2/agentfactory] when applications want the
+// Use [github.com/baldaworks/runtime/v2/agentfactory] when applications want the
 // complete runtime assembly path. Use the lower-level packages directly when a
 // caller needs one specific runtime capability.
 package runtime

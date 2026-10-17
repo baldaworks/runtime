@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/baldaworks/runtime/v2/agentconfig"
 	"github.com/normahq/go-adk-acpagent/v2"
-	"github.com/normahq/runtime/v2/agentconfig"
 	"google.golang.org/adk/v2/agent"
 	"google.golang.org/adk/v2/model"
 	runnerpkg "google.golang.org/adk/v2/runner"

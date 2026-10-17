@@ -3,7 +3,7 @@ package mcpregistry
 import (
 	"fmt"
 
-	"github.com/normahq/runtime/v2/agentconfig"
+	"github.com/baldaworks/runtime/v2/agentconfig"
 )
 
 func ExampleNew() {

@@ -9,7 +9,7 @@ import (
 	"google.golang.org/adk/v2/model"
 	"google.golang.org/adk/v2/tool/mcptoolset"
 
-	"github.com/normahq/runtime/v2/agentconfig"
+	"github.com/baldaworks/runtime/v2/agentconfig"
 )
 
 // recordTransportEndpoints swaps the transport factory for one that records the

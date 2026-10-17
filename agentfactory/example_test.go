@@ -5,9 +5,9 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/normahq/runtime/v2/agentconfig"
-	"github.com/normahq/runtime/v2/mcpregistry"
-	"github.com/normahq/runtime/v2/sessionstate"
+	"github.com/baldaworks/runtime/v2/agentconfig"
+	"github.com/baldaworks/runtime/v2/mcpregistry"
+	"github.com/baldaworks/runtime/v2/sessionstate"
 )
 
 func ExampleFactory_BuildSessionState() {
