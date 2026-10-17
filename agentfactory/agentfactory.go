@@ -141,6 +141,13 @@ func WithStderrWriter(writer io.Writer) Option {
 	}
 }
 
+// withProcessEnvironment injects the Factory environment snapshot for tests.
+func withProcessEnvironment(environment []string) Option {
+	return func(f *Factory) {
+		f.processEnvironment = append([]string{}, environment...)
+	}
+}
+
 // constructor creates a new agent instance.
 type constructor func(ctx context.Context, cfg agentconfig.ResolvedConfig, req BuildRequest, f *Factory, resolvedMCP map[string]agentconfig.MCPServerConfig) (agent.Agent, error)
 
@@ -153,6 +160,7 @@ type Factory struct {
 	permissionHandler          acpagent.PermissionHandler
 	stderrWriter               io.Writer
 	executablePath             string
+	processEnvironment         []string
 }
 
 // New creates a new Factory from agent configurations and an MCP registry.
@@ -162,9 +170,10 @@ func New(agents map[string]agentconfig.Config, mcp mcpregistry.Reader, opts ...O
 		registry[id] = cfg
 	}
 	f := &Factory{
-		registry:     registry,
-		mcpRegistry:  mcp,
-		stderrWriter: os.Stderr,
+		registry:           registry,
+		mcpRegistry:        mcp,
+		stderrWriter:       os.Stderr,
+		processEnvironment: append([]string{}, os.Environ()...),
 	}
 	if exePath, err := os.Executable(); err == nil {
 		f.executablePath = exePath
@@ -683,6 +692,10 @@ var acpConstructor = func(ctx context.Context, cfg agentconfig.ResolvedConfig, r
 	if f.availabilityIndependentMCP {
 		setupTimeout = mcpSetupTimeout
 	}
+	environment, err := cfg.Environment.Resolve(f.processEnvironment)
+	if err != nil {
+		return nil, fmt.Errorf("resolve ACP process environment: %w", err)
+	}
 	return newACPAgent(acpagent.Config{
 		Context:            ctx,
 		LazyInitialization: f.availabilityIndependentMCP,
@@ -695,6 +708,7 @@ var acpConstructor = func(ctx context.Context, cfg agentconfig.ResolvedConfig, r
 		Instruction:       effectiveInstruction(req, cfg),
 		GlobalInstruction: effectiveGlobalInstruction(req),
 		Command:           append([]string(nil), cfg.Command...),
+		Environment:       environment,
 		WorkingDir:        req.WorkingDirectory,
 		ReasoningEffort:   reasoningEffort,
 		Stderr:            f.stderrWriter,
