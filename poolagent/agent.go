@@ -159,34 +159,42 @@ func (p *PoolExecutor) member(ctx context.Context) (*ownedPoolMember, error) {
 	}
 }
 
-// createMember builds the first member that is not cooling down. Members in
-// cooldown are only tried when every other member failed to be created.
+// createMember builds the first member that can be created. Members that are
+// cooling down after a run-time failure are tried last.
 func (p *PoolExecutor) createMember(ctx context.Context) (agent.Agent, int, error) {
 	var lastErr error
 	attemptErrors := make([]AttemptError, 0, len(p.members))
-	for _, ignoreCooldown := range []bool{false, true} {
-		for i, member := range p.members {
-			if !ignoreCooldown && p.coolingDown(member.Name) {
-				continue
-			}
-			if ignoreCooldown && !p.coolingDown(member.Name) {
-				continue
-			}
-			if err := ctx.Err(); err != nil {
-				return nil, 0, err
-			}
-			req := p.req
-			req.Name = p.poolName + "_" + member.Name
-			inner, err := p.agentCreator.CreateAgent(ctx, member.Name, req)
-			if err != nil {
-				attemptErrors = append(attemptErrors, AttemptError{Member: member.Name, Index: i, Err: fmt.Sprintf("create agent %q: %v", member.Name, err)})
-				lastErr = fmt.Errorf("pool %q: all members failed", p.poolName)
-				continue
-			}
-			return inner, i, nil
+	for _, i := range p.candidateOrder() {
+		if err := ctx.Err(); err != nil {
+			return nil, 0, err
 		}
+		member := p.members[i]
+		req := p.req
+		req.Name = p.poolName + "_" + member.Name
+		inner, err := p.agentCreator.CreateAgent(ctx, member.Name, req)
+		if err != nil {
+			attemptErrors = append(attemptErrors, AttemptError{Member: member.Name, Index: i, Err: fmt.Sprintf("create agent %q: %v", member.Name, err)})
+			lastErr = fmt.Errorf("pool %q: all members failed", p.poolName)
+			continue
+		}
+		return inner, i, nil
 	}
 	return nil, 0, &AllPoolMembersFailedError{PoolName: p.poolName, MemberNames: p.memberNames(), Errors: attemptErrors, Err: lastErr}
+}
+
+// candidateOrder lists member indexes in configured order with members that
+// are cooling down moved to the end.
+func (p *PoolExecutor) candidateOrder() []int {
+	ready := make([]int, 0, len(p.members))
+	cooling := make([]int, 0, len(p.members))
+	for i, member := range p.members {
+		if p.coolingDown(member.Name) {
+			cooling = append(cooling, i)
+			continue
+		}
+		ready = append(ready, i)
+	}
+	return append(ready, cooling...)
 }
 
 func (p *PoolExecutor) coolingDown(name string) bool {
@@ -365,8 +373,15 @@ func (p *PoolAgent) run(ctx agent.InvocationContext) iter.Seq2[*session.Event, e
 			if failure == nil {
 				return
 			}
+			// A canceled invocation says nothing about the member's health.
+			if ctx.Err() != nil {
+				failure.yield(yield)
+				return
+			}
 			p.executor.fail(currentMember)
-			if attempt >= maxAttempts {
+			// Output already reached the consumer, so rerunning the turn on
+			// another member would duplicate it.
+			if failure.afterOutput || attempt >= maxAttempts {
 				failure.yield(yield)
 				return
 			}
@@ -383,6 +398,8 @@ func (p *PoolAgent) run(ctx agent.InvocationContext) iter.Seq2[*session.Event, e
 type memberFailure struct {
 	err   error
 	event *session.Event
+	// afterOutput reports that the member already produced content.
+	afterOutput bool
 }
 
 func (f *memberFailure) yield(yield func(*session.Event, error) bool) {
@@ -392,6 +409,7 @@ func (f *memberFailure) yield(yield func(*session.Event, error) bool) {
 // runMember streams one member. It returns a failure when the member returned
 // an error, or reported a provider error (for example a usage limit) before
 // producing any content, so the pool can fail over without duplicating output.
+// An error after content was produced is reported with afterOutput set.
 // Events without content (such as session state updates) are held back until
 // the member produces content or finishes, so a failed member leaks none.
 func runMember(ctx agent.InvocationContext, member *ownedPoolMember, yield func(*session.Event, error) bool) *memberFailure {
@@ -399,7 +417,7 @@ func runMember(ctx agent.InvocationContext, member *ownedPoolMember, yield func(
 	produced := false
 	for ev, err := range member.Run(ctx) {
 		if err != nil {
-			return &memberFailure{err: err}
+			return &memberFailure{err: err, afterOutput: produced}
 		}
 		if ev != nil && ev.ErrorCode != "" && !produced {
 			return &memberFailure{event: ev}
