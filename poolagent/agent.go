@@ -178,6 +178,10 @@ func (p *PoolExecutor) createMember(ctx context.Context) (agent.Agent, int, erro
 		req.Name = p.poolName + "_" + member.Name
 		inner, err := p.agentCreator.CreateAgent(ctx, member.Name, req)
 		if err != nil {
+			// A canceled creation says nothing about the member's health.
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, 0, ctxErr
+			}
 			p.startCooldown(member.Name)
 			attemptErrors = append(attemptErrors, AttemptError{Member: member.Name, Index: i, Err: fmt.Sprintf("create agent %q: %v", member.Name, err)})
 			lastErr = fmt.Errorf("pool %q: all members failed", p.poolName)

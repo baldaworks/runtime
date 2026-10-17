@@ -368,3 +368,23 @@ func TestPoolProviderErrorAfterOutputStartsCooldownWithoutRerun(t *testing.T) {
 		t.Fatalf("next turn must go to the fallback: first=%d second=%d", first.runs, second.runs)
 	}
 }
+
+type cancelingCreator struct{ cancel context.CancelFunc }
+
+func (c *cancelingCreator) CreateAgent(ctx context.Context, _ string, _ AgentRequest) (agent.Agent, error) {
+	c.cancel()
+	return nil, ctx.Err()
+}
+
+func TestPoolCanceledCreationDoesNotStartCooldown(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	creator := &cancelingCreator{cancel: cancel}
+	executor := NewPoolExecutor("pool", []MemberConfig{{Name: "a"}, {Name: "b"}}, creator, AgentRequest{})
+
+	if _, err := executor.member(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("member() error = %v, want context.Canceled", err)
+	}
+	if executor.coolingDown("a") || executor.coolingDown("b") {
+		t.Fatal("a canceled creation put a member into cooldown")
+	}
+}

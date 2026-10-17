@@ -11,7 +11,7 @@ The repo stays as one Go module. The root import path `github.com/baldaworks/run
 - Use `agentconfig` when you already have decoded config and need schema validation or normalization.
 - Use `agentfactory` with ACP provider config when you need ACP subprocess-backed agents.
 - Use `hostedagent` when you want to wrap a local API-backed model as an ADK agent.
-- Use `poolagent` to provide ordered failover across providers. A member that fails to start, returns an error, or reports a provider error (for example a usage limit) before producing content is skipped for five minutes, and the pool returns to the first member once its cooldown ends.
+- Use `poolagent` to provide ordered failover across providers. A member that fails to start, returns an error, or reports a provider error (for example a usage limit) is skipped for five minutes, and the pool returns to the first member once its cooldown ends. If the failure happens before the member produced content the turn continues on the next member; after content the turn is not rerun and the error is returned. A pool with a single member never cools down.
 - Use `structuredagent` to enforce JSON-schema-constrained I/O.
 - Use `mcpregistry` and `sessionstate` as low-level support packages.
 
