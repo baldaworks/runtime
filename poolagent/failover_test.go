@@ -388,3 +388,113 @@ func TestPoolCanceledCreationDoesNotStartCooldown(t *testing.T) {
 		t.Fatal("a canceled creation put a member into cooldown")
 	}
 }
+
+type closableScripted struct {
+	scriptedMember
+	closes int
+}
+
+func (m *closableScripted) Close() error { m.closes++; return nil }
+
+type closableCreator struct {
+	created []*closableScripted
+	spec    map[string]string
+}
+
+func (c *closableCreator) CreateAgent(_ context.Context, name string, _ AgentRequest) (agent.Agent, error) {
+	m := &closableScripted{scriptedMember: scriptedMember{name: name, errorCode: c.spec[name]}}
+	c.created = append(c.created, m)
+	return m, nil
+}
+
+func TestPoolSurfacesProviderErrorWhenNoMemberIsLeft(t *testing.T) {
+	creator := &closableCreator{spec: map[string]string{"a": "usageLimitExceeded", "b": "usageLimitExceeded"}}
+	executor := NewPoolExecutor("pool", []MemberConfig{{Name: "a"}, {Name: "b"}}, creator, AgentRequest{})
+	executor.startCooldown("a")
+	pool := &PoolAgent{executor: executor}
+
+	var last *session.Event
+	for ev, err := range pool.run(retryContext{Context: context.Background()}) {
+		if err != nil {
+			t.Fatalf("want the provider's own error event, got %v", err)
+		}
+		last = ev
+	}
+	if last == nil || last.ErrorCode != "usageLimitExceeded" {
+		t.Fatalf("want the usage limit event, got %+v", last)
+	}
+}
+
+func TestPoolClosesFailedAndReplacedMembers(t *testing.T) {
+	creator := &closableCreator{spec: map[string]string{"primary": "usageLimitExceeded"}}
+	executor := NewPoolExecutor("pool", []MemberConfig{{Name: "primary"}, {Name: "fallback"}}, creator, AgentRequest{})
+	clock := time.Now()
+	executor.now = func() time.Time { return clock }
+	pool := &PoolAgent{executor: executor}
+
+	runPool(t, pool)
+	if len(creator.created) != 2 || creator.created[0].closes != 1 {
+		t.Fatalf("the failed primary must be closed once it failed: created=%d closes=%d", len(creator.created), creator.created[0].closes)
+	}
+
+	clock = clock.Add(memberCooldown + time.Second)
+	creator.spec["primary"] = ""
+	runPool(t, pool)
+	if creator.created[1].closes != 1 {
+		t.Fatalf("the fallback must be closed when the primary takes over: closes=%d", creator.created[1].closes)
+	}
+	if got := len(executor.ownedMembers); got != 1 {
+		t.Fatalf("only the live primary may stay owned, got %d", got)
+	}
+	if err := executor.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if creator.created[0].closes != 1 || creator.created[1].closes != 1 {
+		t.Fatal("a member was closed twice")
+	}
+}
+
+func TestPoolLateFailureOfReplacedInstanceKeepsReplacementHealthy(t *testing.T) {
+	creator := &closableCreator{spec: map[string]string{}}
+	executor := NewPoolExecutor("pool", []MemberConfig{{Name: "a"}, {Name: "b"}}, creator, AgentRequest{})
+
+	old, err := executor.member(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor.discard(old)
+	if _, err := executor.member(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	executor.fail(old)
+	if executor.coolingDown("a") {
+		t.Fatal("a late failure of a replaced instance cooled down its healthy replacement")
+	}
+}
+
+func TestSingleMemberPoolRetriesOnceBeforeOutputOnly(t *testing.T) {
+	before := &erroringMember{}
+	creator := &repeatCreator{member: before}
+	executor := NewPoolExecutor("pool", []MemberConfig{{Name: "only"}}, creator, AgentRequest{})
+	pool := &PoolAgent{executor: executor}
+	for range pool.run(retryContext{Context: context.Background()}) {
+	}
+	if before.runs != 2 {
+		t.Fatalf("a failing single member must run exactly twice, ran %d", before.runs)
+	}
+
+	after := &erroringMember{afterText: true}
+	executor = NewPoolExecutor("pool", []MemberConfig{{Name: "only"}}, &repeatCreator{member: after}, AgentRequest{})
+	pool = &PoolAgent{executor: executor}
+	for range pool.run(retryContext{Context: context.Background()}) {
+	}
+	if after.runs != 1 {
+		t.Fatalf("a single member that failed after output must not be rerun, ran %d", after.runs)
+	}
+}
+
+type repeatCreator struct{ member agent.Agent }
+
+func (c *repeatCreator) CreateAgent(context.Context, string, AgentRequest) (agent.Agent, error) {
+	return c.member, nil
+}

@@ -57,6 +57,7 @@ type PoolExecutor struct {
 	closeOnce      sync.Once
 	closeErr       error
 	cooldowns      map[string]time.Time
+	generations    map[string]int
 	now            func() time.Time
 }
 
@@ -65,6 +66,13 @@ type ownedPoolMember struct {
 	cancel context.CancelFunc
 	name   string
 	index  int
+	// generation numbers the instances created for one member name, so a late
+	// failure of a replaced instance cannot penalize its replacement.
+	generation int
+	// active counts invocations running on this instance. A retired instance
+	// is closed as soon as the last of them ends.
+	active  int
+	retired bool
 }
 
 const poolCloseTimeout = 5 * time.Second
@@ -132,7 +140,12 @@ func (p *PoolExecutor) member(ctx context.Context) (*ownedPoolMember, error) {
 		if !closed {
 			var member *ownedPoolMember
 			if err == nil {
-				member = &ownedPoolMember{Agent: inner, cancel: cancel, name: p.members[idx].Name, index: idx}
+				name := p.members[idx].Name
+				if p.generations == nil {
+					p.generations = make(map[string]int)
+				}
+				p.generations[name]++
+				member = &ownedPoolMember{Agent: inner, cancel: cancel, name: name, index: idx, generation: p.generations[name]}
 				p.cachedMember = member
 				p.ownedMembers = append(p.ownedMembers, member)
 			}
@@ -227,9 +240,15 @@ func (p *PoolExecutor) clearCooldown(name string) {
 }
 
 // fail records a run-time failure: the member sits out memberCooldown and is
-// dropped from the cache so the next member is selected.
+// dropped from the cache so the next member is selected. A failure of an
+// instance that was already replaced does not cool down its replacement.
 func (p *PoolExecutor) fail(member *ownedPoolMember) {
-	p.startCooldown(member.name)
+	p.mu.Lock()
+	current := p.generations[member.name] == member.generation
+	p.mu.Unlock()
+	if current {
+		p.startCooldown(member.name)
+	}
 	p.discard(member)
 }
 
@@ -239,17 +258,77 @@ func (p *PoolExecutor) fail(member *ownedPoolMember) {
 // for: it only gets that far by failing, which records a cooldown.
 func (p *PoolExecutor) refreshPrimary() {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	if p.cachedMember == nil {
+		p.mu.Unlock()
 		return
 	}
 	for i := 0; i < p.cachedMember.index; i++ {
 		until, ok := p.cooldowns[p.members[i].Name]
 		if ok && !p.now().Before(until) {
+			member := p.cachedMember
 			p.cachedMember = nil
+			p.mu.Unlock()
+			p.retire(member)
 			return
 		}
 	}
+	p.mu.Unlock()
+}
+
+// acquire marks one invocation as running on the member.
+func (p *PoolExecutor) acquire(member *ownedPoolMember) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	member.active++
+}
+
+// release ends an invocation and closes the member if it was retired meanwhile.
+func (p *PoolExecutor) release(member *ownedPoolMember) {
+	p.mu.Lock()
+	member.active--
+	closeNow := member.retired && member.active == 0
+	p.mu.Unlock()
+	if closeNow {
+		p.closeMember(member)
+	}
+}
+
+// retire marks a member that left the cache as finished and closes it once no
+// invocation runs on it, so failed and replaced members do not accumulate.
+func (p *PoolExecutor) retire(member *ownedPoolMember) {
+	p.mu.Lock()
+	member.retired = true
+	closeNow := member.active == 0
+	p.mu.Unlock()
+	if closeNow {
+		p.closeMember(member)
+	}
+}
+
+// closeMember releases one member. It is a no-op when Close already took
+// ownership of the member.
+func (p *PoolExecutor) closeMember(member *ownedPoolMember) {
+	p.mu.Lock()
+	owned := false
+	for i, m := range p.ownedMembers {
+		if m == member {
+			p.ownedMembers = append(p.ownedMembers[:i], p.ownedMembers[i+1:]...)
+			owned = true
+			break
+		}
+	}
+	p.mu.Unlock()
+	if !owned {
+		return
+	}
+	var closeErr error
+	if closer, ok := member.Agent.(io.Closer); ok {
+		closeErr = closer.Close()
+	}
+	member.cancel()
+	p.mu.Lock()
+	p.pendingErr = errors.Join(p.pendingErr, closeErr)
+	p.mu.Unlock()
 }
 
 func (p *PoolExecutor) memberNames() string {
@@ -294,14 +373,18 @@ func (p *PoolExecutor) Close() error {
 	return p.closeErr
 }
 
-// A failed member remains owned until Close. Matching the cache entry prevents
-// a late error from an older invocation from evicting its replacement.
+// discard removes the member from the cache and retires it. Matching the cache
+// entry prevents a late error from an older invocation from evicting its
+// replacement.
 func (p *PoolExecutor) discard(member *ownedPoolMember) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.cachedMember == member {
-		p.cachedMember = nil
+	if p.cachedMember != member {
+		p.mu.Unlock()
+		return
 	}
+	p.cachedMember = nil
+	p.mu.Unlock()
+	p.retire(member)
 }
 
 // AttemptError describes one failed member creation attempt.
@@ -387,7 +470,9 @@ func (p *PoolAgent) run(ctx agent.InvocationContext) iter.Seq2[*session.Event, e
 		// from a transient failure, and there is no other member to fall to.
 		maxAttempts := max(len(p.executor.members), 2)
 		for attempt := 1; ; attempt++ {
+			p.executor.acquire(currentMember)
 			failure := runMember(ctx, currentMember, yield)
+			p.executor.release(currentMember)
 			if failure == nil {
 				return
 			}
@@ -405,7 +490,7 @@ func (p *PoolAgent) run(ctx agent.InvocationContext) iter.Seq2[*session.Event, e
 			}
 			currentMember, err = p.executor.member(ctx)
 			if err != nil {
-				yield(nil, err)
+				failure.yieldWithCause(yield, err)
 				return
 			}
 		}
@@ -422,6 +507,17 @@ type memberFailure struct {
 
 func (f *memberFailure) yield(yield func(*session.Event, error) bool) {
 	yield(f.event, f.err)
+}
+
+// yieldWithCause reports the failure when no other member could take over. The
+// member's own error or provider error event is what the caller needs to see;
+// the selection error is attached to a Go error and dropped for an event.
+func (f *memberFailure) yieldWithCause(yield func(*session.Event, error) bool, selection error) {
+	if f.err != nil {
+		yield(nil, errors.Join(f.err, selection))
+		return
+	}
+	yield(f.event, nil)
 }
 
 // runMember streams one member. It returns a failure when the member returned
