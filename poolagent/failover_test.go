@@ -804,3 +804,31 @@ func TestPoolEventsAreAuthoredByThePool(t *testing.T) {
 		}
 	}
 }
+
+func TestPoolTerminalErrorAfterPartialOutputIsAuthoredByThePool(t *testing.T) {
+	first := &partialThenErrorMember{}
+	second := &scriptedMember{name: "second"}
+	creator := &partialCreator{first: first, second: second}
+	members := []MemberConfig{{Name: "first"}, {Name: "second"}}
+	pool, err := NewPoolAgent(context.Background(), "pool", members, AgentRequest{}, creator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = pool.Close() }()
+
+	events := runPool(t, pool)
+	if len(events) != 2 {
+		t.Fatalf("want the partial text and the terminal provider error, got %d events", len(events))
+	}
+	for _, ev := range events {
+		if ev.Author != "pool" {
+			t.Fatalf("event author = %q, want the pool name", ev.Author)
+		}
+	}
+	if events[0].Content == nil || events[1].ErrorCode != "usageLimitExceeded" {
+		t.Fatalf("want text then the terminal error, got %+v / %+v", events[0], events[1])
+	}
+	if second.runs != 0 {
+		t.Fatalf("the turn was rerun on another member after output: runs=%d", second.runs)
+	}
+}
