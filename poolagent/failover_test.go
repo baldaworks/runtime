@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"iter"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -497,4 +499,107 @@ type repeatCreator struct{ member agent.Agent }
 
 func (c *repeatCreator) CreateAgent(context.Context, string, AgentRequest) (agent.Agent, error) {
 	return c.member, nil
+}
+
+func TestPoolMemberIsInUseFromSelectionOn(t *testing.T) {
+	creator := &closableCreator{spec: map[string]string{}}
+	executor := NewPoolExecutor("pool", []MemberConfig{{Name: "a"}, {Name: "b"}}, creator, AgentRequest{})
+
+	selected, err := executor.acquireMember(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Another invocation evicts the member right after it was selected.
+	executor.discard(selected)
+	if creator.created[0].closes != 0 {
+		t.Fatal("a selected member was closed before its invocation ran")
+	}
+	executor.release(selected)
+	if creator.created[0].closes != 1 {
+		t.Fatalf("the member must close once its last invocation ended: closes=%d", creator.created[0].closes)
+	}
+}
+
+func TestPoolCachedMemberIsInUseFromSelectionOn(t *testing.T) {
+	creator := &closableCreator{spec: map[string]string{}}
+	executor := NewPoolExecutor("pool", []MemberConfig{{Name: "a"}}, creator, AgentRequest{})
+	first, err := executor.acquireMember(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := executor.acquireMember(context.Background())
+	if err != nil || second != first {
+		t.Fatalf("want the cached member, got %v err=%v", second, err)
+	}
+	executor.discard(first)
+	executor.release(first)
+	if creator.created[0].closes != 0 {
+		t.Fatal("closed while a second invocation still runs on the member")
+	}
+	executor.release(second)
+	if creator.created[0].closes != 1 {
+		t.Fatalf("closes=%d, want 1 after the last release", creator.created[0].closes)
+	}
+}
+
+func TestPoolConcurrentTurnsDoNotRunClosedMembers(t *testing.T) {
+	creator := &concurrentCreator{}
+	executor := NewPoolExecutor("pool", []MemberConfig{{Name: "a"}, {Name: "b"}}, creator, AgentRequest{})
+	clock := time.Now()
+	var mu sync.Mutex
+	executor.now = func() time.Time { mu.Lock(); defer mu.Unlock(); return clock }
+	pool := &PoolAgent{executor: executor}
+
+	var wg sync.WaitGroup
+	for i := range 40 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if i%5 == 0 {
+				mu.Lock()
+				clock = clock.Add(memberCooldown + time.Second)
+				mu.Unlock()
+			}
+			for range pool.run(retryContext{Context: context.Background()}) {
+			}
+		}()
+	}
+	wg.Wait()
+	if n := creator.ranClosed.Load(); n != 0 {
+		t.Fatalf("%d invocations ran on an already closed member", n)
+	}
+	if err := executor.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+type concurrentMember struct {
+	agent.Agent
+	name   string
+	closed atomic.Bool
+	owner  *concurrentCreator
+}
+
+func (m *concurrentMember) Close() error { m.closed.Store(true); return nil }
+
+func (m *concurrentMember) Run(agent.InvocationContext) iter.Seq2[*session.Event, error] {
+	return func(yield func(*session.Event, error) bool) {
+		if m.closed.Load() {
+			m.owner.ranClosed.Add(1)
+		}
+		time.Sleep(time.Millisecond)
+		ev := &session.Event{}
+		if m.name == "a" {
+			ev.LLMResponse = model.LLMResponse{ErrorCode: "usageLimitExceeded"}
+		} else {
+			ev.Content = genai.NewContentFromText("ok", genai.RoleModel)
+		}
+		yield(ev, nil)
+	}
+}
+
+type concurrentCreator struct{ ranClosed atomic.Int32 }
+
+func (c *concurrentCreator) CreateAgent(_ context.Context, name string, _ AgentRequest) (agent.Agent, error) {
+	return &concurrentMember{name: name, owner: c}, nil
 }

@@ -102,8 +102,21 @@ func (p *PoolExecutor) Agent(ctx context.Context) (agent.Agent, error) {
 	return member.Agent, nil
 }
 
-// member serializes creation without holding mu across an external constructor.
+// member returns the cached member or creates one, without marking it in use.
 func (p *PoolExecutor) member(ctx context.Context) (*ownedPoolMember, error) {
+	return p.selectMember(ctx, false)
+}
+
+// acquireMember selects a member and marks it in use in one step under mu, so
+// no other invocation can retire and close it between the choice and the run.
+// The caller must release it.
+func (p *PoolExecutor) acquireMember(ctx context.Context) (*ownedPoolMember, error) {
+	return p.selectMember(ctx, true)
+}
+
+// selectMember serializes creation without holding mu across an external
+// constructor.
+func (p *PoolExecutor) selectMember(ctx context.Context, acquire bool) (*ownedPoolMember, error) {
 	for {
 		p.mu.Lock()
 		if p.closed {
@@ -112,6 +125,9 @@ func (p *PoolExecutor) member(ctx context.Context) (*ownedPoolMember, error) {
 		}
 		if p.cachedMember != nil {
 			member := p.cachedMember
+			if acquire {
+				member.active++
+			}
 			p.mu.Unlock()
 			return member, nil
 		}
@@ -146,6 +162,9 @@ func (p *PoolExecutor) member(ctx context.Context) (*ownedPoolMember, error) {
 				}
 				p.generations[name]++
 				member = &ownedPoolMember{Agent: inner, cancel: cancel, name: name, index: idx, generation: p.generations[name]}
+				if acquire {
+					member.active++
+				}
 				p.cachedMember = member
 				p.ownedMembers = append(p.ownedMembers, member)
 			}
@@ -273,13 +292,6 @@ func (p *PoolExecutor) refreshPrimary() {
 		}
 	}
 	p.mu.Unlock()
-}
-
-// acquire marks one invocation as running on the member.
-func (p *PoolExecutor) acquire(member *ownedPoolMember) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	member.active++
 }
 
 // release ends an invocation and closes the member if it was retired meanwhile.
@@ -460,7 +472,7 @@ func NewPoolAgent(ctx context.Context, poolName string, members []MemberConfig, 
 func (p *PoolAgent) run(ctx agent.InvocationContext) iter.Seq2[*session.Event, error] {
 	return func(yield func(*session.Event, error) bool) {
 		p.executor.refreshPrimary()
-		currentMember, err := p.executor.member(ctx)
+		currentMember, err := p.executor.acquireMember(ctx)
 		if err != nil {
 			yield(nil, err)
 			return
@@ -470,9 +482,7 @@ func (p *PoolAgent) run(ctx agent.InvocationContext) iter.Seq2[*session.Event, e
 		// from a transient failure, and there is no other member to fall to.
 		maxAttempts := max(len(p.executor.members), 2)
 		for attempt := 1; ; attempt++ {
-			p.executor.acquire(currentMember)
-			failure := runMember(ctx, currentMember, yield)
-			p.executor.release(currentMember)
+			failure := p.runAcquired(ctx, currentMember, yield)
 			if failure == nil {
 				return
 			}
@@ -488,13 +498,20 @@ func (p *PoolAgent) run(ctx agent.InvocationContext) iter.Seq2[*session.Event, e
 				failure.yield(yield)
 				return
 			}
-			currentMember, err = p.executor.member(ctx)
+			currentMember, err = p.executor.acquireMember(ctx)
 			if err != nil {
 				failure.yieldWithCause(yield, err)
 				return
 			}
 		}
 	}
+}
+
+// runAcquired runs a member selected with acquireMember and always releases it,
+// even when the consumer stops early or the member panics.
+func (p *PoolAgent) runAcquired(ctx agent.InvocationContext, member *ownedPoolMember, yield func(*session.Event, error) bool) *memberFailure {
+	defer p.executor.release(member)
+	return runMember(ctx, member, yield)
 }
 
 // memberFailure is the error or provider error event that made a member fail.
