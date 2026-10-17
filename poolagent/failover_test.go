@@ -937,3 +937,63 @@ func TestPoolCallerCancelingConstructionDiscardsTheMember(t *testing.T) {
 		t.Fatal("a member built for a canceled caller was cached")
 	}
 }
+
+type gatedCreator struct {
+	member  *closableScripted
+	started chan struct{}
+	release chan struct{}
+}
+
+func (c *gatedCreator) CreateAgent(context.Context, string, AgentRequest) (agent.Agent, error) {
+	close(c.started)
+	<-c.release
+	return c.member, nil
+}
+
+func TestPoolClosesAMemberBuiltForACanceledCallerOnlyOnceWhenThePoolIsClosed(t *testing.T) {
+	creator := &gatedCreator{
+		member:  &closableScripted{scriptedMember: scriptedMember{name: "a"}},
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	executor := NewPoolExecutor("pool", []MemberConfig{{Name: "a"}, {Name: "b"}}, creator, AgentRequest{})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, err := executor.member(ctx)
+		result <- err
+	}()
+	<-creator.started
+	cancel() // the caller gives up while the member is still being built
+	closed := make(chan error, 1)
+	go func() { closed <- executor.Close() }()
+	// Finish the construction only after Close has marked the pool closed.
+	for deadline := time.Now().Add(5 * time.Second); ; {
+		executor.mu.Lock()
+		isClosed := executor.closed
+		executor.mu.Unlock()
+		if isClosed {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("Close did not mark the pool closed")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	close(creator.release)
+
+	select {
+	case <-result:
+	case <-time.After(5 * time.Second):
+		t.Fatal("member() did not return")
+	}
+	select {
+	case <-closed:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Close did not return")
+	}
+	if creator.member.closes != 1 {
+		t.Fatalf("the member was closed %d times, want exactly once", creator.member.closes)
+	}
+}

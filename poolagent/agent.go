@@ -167,6 +167,8 @@ func (p *PoolExecutor) selectMember(ctx context.Context, acquire bool) (*ownedPo
 			if closer, ok := inner.(io.Closer); ok {
 				err = errors.Join(err, closer.Close())
 			}
+			// Closed here: the pool-closed branch below must not close it again.
+			inner = nil
 		}
 		if err != nil {
 			cancel()
