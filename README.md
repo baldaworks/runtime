@@ -11,7 +11,7 @@ The repo stays as one Go module. The root import path `github.com/baldaworks/run
 - Use `agentconfig` when you already have decoded config and need schema validation or normalization.
 - Use `agentfactory` with ACP provider config when you need ACP subprocess-backed agents.
 - Use `hostedagent` when you want to wrap a local API-backed model as an ADK agent.
-- Use `poolagent` to provide ordered failover across providers.
+- Use `poolagent` to provide ordered failover across providers. Before visible or tool output, account/provider quota, rate-limit, authentication, payment, and availability failures can continue on the next member. Rate and availability failures receive a bounded cooldown, quota uses a longer cooldown, and authentication or payment failures retire the member until pool recreation. Request, session, unknown, cancellation, and post-output failures are returned without replaying the turn.
 - Use `structuredagent` to enforce JSON-schema-constrained I/O.
 - Use `mcpregistry` and `sessionstate` as low-level support packages.
 
@@ -110,7 +110,7 @@ func main() {
 		"codex": {
 			Type: agentconfig.AgentTypeCodexACP,
 			CodexACP: &agentconfig.ACPConfig{
-				BridgeVersion: "1.10.1",
+				BridgeVersion: "1.11.0",
 			},
 		},
 	}
@@ -142,7 +142,7 @@ returns a shutdown timeout; its late result remains registered for cleanup.
 
 For `codex_acp`, `bridge_version` accepts an npm version or dist-tag for
 the canonical [`codex-acp`](https://github.com/baldaworks/codex-acp) package;
-empty defaults to the tested `1.10.1` release. The configuration field keeps
+empty defaults to the tested `1.11.0` release. The configuration field keeps
 its existing name for compatibility.
 
 `registry_acp` allows running any agent from the official [ACP Registry](https://agentclientprotocol.com)

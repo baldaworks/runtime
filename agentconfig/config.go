@@ -90,7 +90,7 @@ type ACPConfig struct {
 
 const (
 	codexACPPackageName    = "codex-acp"
-	defaultCodexACPVersion = "1.10.1"
+	defaultCodexACPVersion = "1.11.0"
 	acpRunPackageName      = "@baldaworks/acprun"
 	defaultACPRunVersion   = "0.1.6"
 	npxCommand             = "npx"
