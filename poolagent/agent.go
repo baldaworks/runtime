@@ -423,7 +423,8 @@ func (f *memberFailure) yield(yield func(*session.Event, error) bool) {
 // runMember streams one member. It returns a failure when the member returned
 // an error, or reported a provider error (for example a usage limit) before
 // producing any content, so the pool can fail over without duplicating output.
-// An error after content was produced is reported with afterOutput set.
+// An error or provider error after content was produced is reported with
+// afterOutput set: the turn is not rerun, but the member still fails.
 // Events without content (such as session state updates) are held back until
 // the member produces content or finishes, so a failed member leaks none.
 func runMember(ctx agent.InvocationContext, member *ownedPoolMember, yield func(*session.Event, error) bool) *memberFailure {
@@ -433,8 +434,8 @@ func runMember(ctx agent.InvocationContext, member *ownedPoolMember, yield func(
 		if err != nil {
 			return &memberFailure{err: err, afterOutput: produced}
 		}
-		if ev != nil && ev.ErrorCode != "" && !produced {
-			return &memberFailure{event: ev}
+		if ev != nil && ev.ErrorCode != "" {
+			return &memberFailure{event: ev, afterOutput: produced}
 		}
 		if !produced && !hasContent(ev) {
 			held = append(held, ev)

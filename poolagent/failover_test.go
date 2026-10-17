@@ -307,3 +307,64 @@ func TestPoolErrorAfterOutputIsTerminal(t *testing.T) {
 		t.Fatalf("want one event then the original error, got events=%d errs=%v", events, errs)
 	}
 }
+
+type partialThenErrorMember struct {
+	agent.Agent
+	runs int
+}
+
+func (m *partialThenErrorMember) Run(agent.InvocationContext) iter.Seq2[*session.Event, error] {
+	return func(yield func(*session.Event, error) bool) {
+		m.runs++
+		text := &session.Event{}
+		text.Content = genai.NewContentFromText("partial", genai.RoleModel)
+		if !yield(text, nil) {
+			return
+		}
+		failed := &session.Event{}
+		failed.LLMResponse = model.LLMResponse{ErrorCode: "usageLimitExceeded", ErrorMessage: "limit"}
+		yield(failed, nil)
+	}
+}
+
+type partialCreator struct {
+	first  *partialThenErrorMember
+	second *scriptedMember
+}
+
+func (c *partialCreator) CreateAgent(_ context.Context, name string, _ AgentRequest) (agent.Agent, error) {
+	if name == "first" {
+		return c.first, nil
+	}
+	return c.second, nil
+}
+
+func TestPoolProviderErrorAfterOutputStartsCooldownWithoutRerun(t *testing.T) {
+	first := &partialThenErrorMember{}
+	second := &scriptedMember{name: "second"}
+	creator := &partialCreator{first: first, second: second}
+	executor := NewPoolExecutor("pool", []MemberConfig{{Name: "first"}, {Name: "second"}}, creator, AgentRequest{})
+	pool := &PoolAgent{executor: executor}
+
+	var events []*session.Event
+	for ev, err := range pool.run(retryContext{Context: context.Background()}) {
+		if err != nil {
+			t.Fatal(err)
+		}
+		events = append(events, ev)
+	}
+	if len(events) != 2 || events[1].ErrorCode != "usageLimitExceeded" {
+		t.Fatalf("want the partial text and then the provider error, got %d events", len(events))
+	}
+	if second.runs != 0 {
+		t.Fatalf("turn was rerun on the fallback after output: runs=%d", second.runs)
+	}
+	if !executor.coolingDown("first") {
+		t.Fatal("a provider that failed after output must start a cooldown")
+	}
+
+	runPool(t, pool)
+	if first.runs != 1 || second.runs != 1 {
+		t.Fatalf("next turn must go to the fallback: first=%d second=%d", first.runs, second.runs)
+	}
+}
