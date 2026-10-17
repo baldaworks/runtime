@@ -160,77 +160,91 @@ func (p *PoolExecutor) member(ctx context.Context) (*ownedPoolMember, error) {
 }
 
 // createMember builds the first member that can be created. Members that are
-// cooling down after a run-time failure are tried last.
+// cooling down are skipped; a member that cannot be created starts a cooldown
+// so it is not probed again on every turn.
 func (p *PoolExecutor) createMember(ctx context.Context) (agent.Agent, int, error) {
 	var lastErr error
 	attemptErrors := make([]AttemptError, 0, len(p.members))
-	for _, i := range p.candidateOrder() {
+	for i, member := range p.members {
+		if until, cooling := p.cooldownUntil(member.Name); cooling {
+			attemptErrors = append(attemptErrors, AttemptError{Member: member.Name, Index: i, Err: fmt.Sprintf("cooling down until %s", until.Format(time.RFC3339))})
+			lastErr = fmt.Errorf("pool %q: all members failed", p.poolName)
+			continue
+		}
 		if err := ctx.Err(); err != nil {
 			return nil, 0, err
 		}
-		member := p.members[i]
 		req := p.req
 		req.Name = p.poolName + "_" + member.Name
 		inner, err := p.agentCreator.CreateAgent(ctx, member.Name, req)
 		if err != nil {
+			p.startCooldown(member.Name)
 			attemptErrors = append(attemptErrors, AttemptError{Member: member.Name, Index: i, Err: fmt.Sprintf("create agent %q: %v", member.Name, err)})
 			lastErr = fmt.Errorf("pool %q: all members failed", p.poolName)
 			continue
 		}
+		p.clearCooldown(member.Name)
 		return inner, i, nil
 	}
 	return nil, 0, &AllPoolMembersFailedError{PoolName: p.poolName, MemberNames: p.memberNames(), Errors: attemptErrors, Err: lastErr}
 }
 
-// candidateOrder lists member indexes in configured order with members that
-// are cooling down moved to the end.
-func (p *PoolExecutor) candidateOrder() []int {
-	ready := make([]int, 0, len(p.members))
-	cooling := make([]int, 0, len(p.members))
-	for i, member := range p.members {
-		if p.coolingDown(member.Name) {
-			cooling = append(cooling, i)
-			continue
-		}
-		ready = append(ready, i)
-	}
-	return append(ready, cooling...)
-}
-
-func (p *PoolExecutor) coolingDown(name string) bool {
+// cooldownUntil reports whether the named member is still cooling down.
+func (p *PoolExecutor) cooldownUntil(name string) (time.Time, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	until, ok := p.cooldowns[name]
-	return ok && p.now().Before(until)
+	return until, ok && p.now().Before(until)
+}
+
+func (p *PoolExecutor) coolingDown(name string) bool {
+	_, cooling := p.cooldownUntil(name)
+	return cooling
+}
+
+// startCooldown keeps the member out of selection for memberCooldown. A pool
+// with a single member has nothing to fall back to, so it never cools down.
+func (p *PoolExecutor) startCooldown(name string) {
+	if len(p.members) < 2 {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.cooldowns == nil {
+		p.cooldowns = make(map[string]time.Time)
+	}
+	p.cooldowns[name] = p.now().Add(memberCooldown)
+}
+
+func (p *PoolExecutor) clearCooldown(name string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	delete(p.cooldowns, name)
 }
 
 // fail records a run-time failure: the member sits out memberCooldown and is
 // dropped from the cache so the next member is selected.
 func (p *PoolExecutor) fail(member *ownedPoolMember) {
-	p.mu.Lock()
-	if p.cooldowns == nil {
-		p.cooldowns = make(map[string]time.Time)
-	}
-	p.cooldowns[member.name] = p.now().Add(memberCooldown)
-	p.mu.Unlock()
+	p.startCooldown(member.name)
 	p.discard(member)
 }
 
-// refreshPrimary drops a cached fallback member once a higher-priority member
-// finished its cooldown, so the pool returns to the preferred provider.
+// refreshPrimary drops a cached fallback member once the cooldown of a
+// higher-priority member has ended, so the pool probes the preferred provider
+// again. A higher-priority member without a cooldown record is never dropped
+// for: it only gets that far by failing, which records a cooldown.
 func (p *PoolExecutor) refreshPrimary() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.cachedMember == nil || p.cachedMember.index == 0 {
+	if p.cachedMember == nil {
 		return
 	}
 	for i := 0; i < p.cachedMember.index; i++ {
 		until, ok := p.cooldowns[p.members[i].Name]
-		if ok && p.now().Before(until) {
-			continue
+		if ok && !p.now().Before(until) {
+			p.cachedMember = nil
+			return
 		}
-		p.cachedMember = nil
-		return
 	}
 }
 

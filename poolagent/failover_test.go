@@ -206,3 +206,104 @@ func TestPoolErrorBeforeOutputFailsOver(t *testing.T) {
 		t.Fatal("failed member must be cooling down")
 	}
 }
+
+type countingCreator struct {
+	failing map[string]bool
+	created map[string]int
+	members map[string]*scriptedMember
+}
+
+func (c *countingCreator) CreateAgent(_ context.Context, name string, _ AgentRequest) (agent.Agent, error) {
+	c.created[name]++
+	if c.failing[name] {
+		return nil, errors.New("cannot start")
+	}
+	return c.members[name], nil
+}
+
+func newCountingPool(failing ...string) (*PoolAgent, *PoolExecutor, *countingCreator, *time.Time) {
+	creator := &countingCreator{
+		failing: map[string]bool{},
+		created: map[string]int{},
+		members: map[string]*scriptedMember{
+			"primary":  {name: "primary"},
+			"fallback": {name: "fallback"},
+		},
+	}
+	for _, name := range failing {
+		creator.failing[name] = true
+	}
+	members := []MemberConfig{{Name: "primary"}, {Name: "fallback"}}
+	executor := NewPoolExecutor("pool", members, creator, AgentRequest{})
+	clock := time.Now()
+	executor.now = func() time.Time { return clock }
+	return &PoolAgent{executor: executor}, executor, creator, &clock
+}
+
+func TestPoolCreationFailureHonorsCooldown(t *testing.T) {
+	pool, _, creator, clock := newCountingPool("primary")
+
+	runPool(t, pool)
+	runPool(t, pool)
+	if creator.created["primary"] != 1 || creator.created["fallback"] != 1 {
+		t.Fatalf("members must not be recreated every turn: %v", creator.created)
+	}
+
+	*clock = clock.Add(memberCooldown + time.Second)
+	runPool(t, pool)
+	if creator.created["primary"] != 2 {
+		t.Fatalf("primary must be probed once its cooldown ended: %v", creator.created)
+	}
+}
+
+func TestPoolDoesNotProbeCoolingMembers(t *testing.T) {
+	pool, executor, creator, _ := newCountingPool()
+	executor.startCooldown("primary")
+	executor.startCooldown("fallback")
+
+	var gotErr error
+	for _, err := range pool.run(retryContext{Context: context.Background()}) {
+		gotErr = err
+	}
+	var all *AllPoolMembersFailedError
+	if !errors.As(gotErr, &all) {
+		t.Fatalf("want AllPoolMembersFailedError, got %v", gotErr)
+	}
+	if len(creator.created) != 0 {
+		t.Fatalf("cooling members were probed: %v", creator.created)
+	}
+}
+
+func TestSingleMemberPoolNeverCoolsDown(t *testing.T) {
+	creator := &countingCreator{
+		failing: map[string]bool{},
+		created: map[string]int{},
+		members: map[string]*scriptedMember{"only": {name: "only"}},
+	}
+	executor := NewPoolExecutor("pool", []MemberConfig{{Name: "only"}}, creator, AgentRequest{})
+	executor.startCooldown("only")
+	if executor.coolingDown("only") {
+		t.Fatal("a pool without alternatives must not cool its only member down")
+	}
+}
+
+func TestPoolErrorAfterOutputIsTerminal(t *testing.T) {
+	first := &erroringMember{afterText: true}
+	second := &scriptedMember{name: "second"}
+	pool, _ := newErroringPool(first, second)
+
+	var events int
+	var errs []error
+	for ev, err := range pool.run(retryContext{Context: context.Background()}) {
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		if ev.Content != nil {
+			events++
+		}
+	}
+	if events != 1 || len(errs) != 1 || errs[0].Error() != "boom" {
+		t.Fatalf("want one event then the original error, got events=%d errs=%v", events, errs)
+	}
+}
