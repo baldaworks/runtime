@@ -557,6 +557,7 @@ type cancelingCreator struct{ cancel context.CancelFunc }
 
 func (c *cancelingCreator) CreateAgent(ctx context.Context, _ string, _ AgentRequest) (agent.Agent, error) {
 	c.cancel()
+	<-ctx.Done()
 	return nil, ctx.Err()
 }
 
@@ -833,5 +834,106 @@ func TestPoolTerminalErrorAfterPartialOutputIsAuthoredByThePool(t *testing.T) {
 	}
 	if second.runs != 0 {
 		t.Fatalf("the turn was rerun on another member after output: runs=%d", second.runs)
+	}
+}
+
+// lifetimeMember fails when the context it was constructed with is canceled,
+// like an ACP agent whose process dies with its construction context.
+type lifetimeMember struct {
+	agent.Agent
+	constructed context.Context
+	runs        int
+}
+
+func (m *lifetimeMember) Run(agent.InvocationContext) iter.Seq2[*session.Event, error] {
+	return func(yield func(*session.Event, error) bool) {
+		m.runs++
+		if err := m.constructed.Err(); err != nil {
+			yield(nil, err)
+			return
+		}
+		ev := &session.Event{}
+		ev.Content = genai.NewContentFromText("ok", genai.RoleModel)
+		yield(ev, nil)
+	}
+}
+
+type lifetimeCreator struct {
+	members map[string]*lifetimeMember
+}
+
+func (c *lifetimeCreator) CreateAgent(ctx context.Context, name string, _ AgentRequest) (agent.Agent, error) {
+	m := &lifetimeMember{constructed: ctx}
+	c.members[name] = m
+	return m, nil
+}
+
+func TestPoolMemberOutlivesTheInvocationThatCreatedIt(t *testing.T) {
+	creator := &lifetimeCreator{members: map[string]*lifetimeMember{}}
+	members := []MemberConfig{{Name: "first"}, {Name: "second"}}
+	executor := NewPoolExecutor("pool", members, creator, AgentRequest{})
+	pool := &PoolAgent{executor: executor}
+
+	first, cancelFirst := context.WithCancel(context.Background())
+	for range pool.run(retryContext{Context: first}) {
+	}
+	cancelFirst() // the turn that created the member is over
+
+	events := 0
+	for ev, err := range pool.run(retryContext{Context: context.Background()}) {
+		if err != nil {
+			t.Fatalf("the next turn failed on the cached member: %v", err)
+		}
+		if ev.Content != nil {
+			events++
+		}
+	}
+	if events != 1 {
+		t.Fatalf("want one reply in the second turn, got %d", events)
+	}
+	if len(creator.members) != 1 || creator.members["first"].runs != 2 {
+		t.Fatalf("the same member must serve both turns: members=%d runs=%d", len(creator.members), creator.members["first"].runs)
+	}
+	if executor.coolingDown("first") {
+		t.Fatal("a healthy member was put into cooldown")
+	}
+}
+
+type abortableCreator struct {
+	member *closableScripted
+	gotCtx chan context.Context
+}
+
+func (c *abortableCreator) CreateAgent(ctx context.Context, _ string, _ AgentRequest) (agent.Agent, error) {
+	c.gotCtx <- ctx
+	<-ctx.Done()
+	return c.member, nil // finished building only after the caller gave up
+}
+
+func TestPoolCallerCancelingConstructionDiscardsTheMember(t *testing.T) {
+	creator := &abortableCreator{member: &closableScripted{scriptedMember: scriptedMember{name: "a"}}, gotCtx: make(chan context.Context, 1)}
+	executor := NewPoolExecutor("pool", []MemberConfig{{Name: "a"}, {Name: "b"}}, creator, AgentRequest{})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, err := executor.member(ctx)
+		result <- err
+	}()
+	<-creator.gotCtx
+	cancel()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("member() error = %v, want context.Canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("canceling the caller did not abort the construction")
+	}
+	if creator.member.closes != 1 {
+		t.Fatalf("a member built after the caller gave up must be closed once, closes=%d", creator.member.closes)
+	}
+	if executor.cachedMember != nil {
+		t.Fatal("a member built for a canceled caller was cached")
 	}
 }

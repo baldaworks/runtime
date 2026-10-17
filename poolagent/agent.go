@@ -148,13 +148,26 @@ func (p *PoolExecutor) selectMember(ctx context.Context, acquire bool) (*ownedPo
 				return nil, ctx.Err()
 			}
 		}
-		createCtx, cancel := context.WithCancel(ctx)
+		// The member outlives the invocation that happened to create it: its
+		// construction context is canceled by the pool, not by that caller.
+		// Tying it to the caller kills the member's process when the first turn
+		// ends and every later turn would then fail on a dead member.
+		createCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+		stop := context.AfterFunc(ctx, cancel) // abort construction if the caller gives up
 		done := make(chan struct{})
 		p.creating = done
 		p.creationCancel = cancel
 		p.mu.Unlock()
 
 		inner, idx, err := p.createMember(createCtx)
+		if !stop() && err == nil {
+			// The caller gave up while the member was being built: its context
+			// is canceled already, so the member cannot be kept.
+			err = context.Cause(ctx)
+			if closer, ok := inner.(io.Closer); ok {
+				err = errors.Join(err, closer.Close())
+			}
+		}
 		if err != nil {
 			cancel()
 		}
