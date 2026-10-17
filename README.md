@@ -2,7 +2,7 @@
 
 `runtime` is a standalone Go module containing reusable agent runtime packages extracted from `norma`.
 
-The repo stays as one Go module. The root import path `github.com/normahq/runtime/v2` is documentation-only; functional APIs live in the subpackages.
+The repo stays as one Go module. The root import path `github.com/baldaworks/runtime/v2` is documentation-only; functional APIs live in the subpackages.
 
 ## Start Here
 
@@ -18,22 +18,22 @@ The repo stays as one Go module. The root import path `github.com/normahq/runtim
 ## Installation
 
 ```bash
-go get github.com/normahq/runtime/v2
+go get github.com/baldaworks/runtime/v2
 ```
 
 ## Packages
 
-- `github.com/normahq/runtime/v2/agentconfig`
-- `github.com/normahq/runtime/v2/agentfactory`
-- `github.com/normahq/runtime/v2/appconfig`
-- `github.com/normahq/runtime/v2/hostedagent`
-- `github.com/normahq/runtime/v2/mcpregistry`
-- `github.com/normahq/runtime/v2/poolagent`
-- `github.com/normahq/runtime/v2`
-- `github.com/normahq/runtime/v2/sessionstate`
-- `github.com/normahq/runtime/v2/structuredagent`
-- `github.com/normahq/runtime/v2/taskmaster`
-- `github.com/normahq/runtime/v2/taskmaster/adk`
+- `github.com/baldaworks/runtime/v2/agentconfig`
+- `github.com/baldaworks/runtime/v2/agentfactory`
+- `github.com/baldaworks/runtime/v2/appconfig`
+- `github.com/baldaworks/runtime/v2/hostedagent`
+- `github.com/baldaworks/runtime/v2/mcpregistry`
+- `github.com/baldaworks/runtime/v2/poolagent`
+- `github.com/baldaworks/runtime/v2`
+- `github.com/baldaworks/runtime/v2/sessionstate`
+- `github.com/baldaworks/runtime/v2/structuredagent`
+- `github.com/baldaworks/runtime/v2/taskmaster`
+- `github.com/baldaworks/runtime/v2/taskmaster/adk`
 
 ## Usage
 
@@ -69,7 +69,7 @@ package main
 import (
 	"fmt"
 
-	"github.com/normahq/runtime/v2/appconfig"
+	"github.com/baldaworks/runtime/v2/appconfig"
 )
 
 func main() {
@@ -100,9 +100,9 @@ package main
 import (
 	"context"
 
-	"github.com/normahq/runtime/v2/agentconfig"
-	"github.com/normahq/runtime/v2/agentfactory"
-	"github.com/normahq/runtime/v2/mcpregistry"
+	"github.com/baldaworks/runtime/v2/agentconfig"
+	"github.com/baldaworks/runtime/v2/agentfactory"
+	"github.com/baldaworks/runtime/v2/mcpregistry"
 )
 
 func main() {
@@ -174,8 +174,9 @@ Runtime v2 uses that package internally through `agentfactory`.
 
 ## Migration Notes
 
-- `github.com/normahq/runtime/...` imports move to `github.com/normahq/runtime/v2/...`.
-- `github.com/normahq/norma/pkg/runtime/...` imports move to `github.com/normahq/runtime/v2/...`.
+- `github.com/normahq/runtime/v2/...` imports move to `github.com/baldaworks/runtime/v2/...`.
+- `github.com/normahq/runtime/...` imports move to `github.com/baldaworks/runtime/v2/...`.
+- `github.com/normahq/norma/pkg/runtime/...` imports move to `github.com/baldaworks/runtime/v2/...`.
 - ADK imports must use `google.golang.org/adk/v2/...`.
 - The old `github.com/normahq/runtime/acpagent` package is removed; use `github.com/normahq/go-adk-acpagent/v2`.
 - The old `providererror` package is removed.

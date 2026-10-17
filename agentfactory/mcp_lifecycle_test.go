@@ -17,10 +17,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/baldaworks/runtime/v2/agentconfig"
+	"github.com/baldaworks/runtime/v2/hostedagent"
+	"github.com/baldaworks/runtime/v2/mcpregistry"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
-	"github.com/normahq/runtime/v2/agentconfig"
-	"github.com/normahq/runtime/v2/hostedagent"
-	"github.com/normahq/runtime/v2/mcpregistry"
 	"google.golang.org/adk/v2/agent"
 	"google.golang.org/adk/v2/model"
 	"google.golang.org/adk/v2/tool"
