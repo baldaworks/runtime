@@ -16,6 +16,9 @@ import (
 	"google.golang.org/genai"
 )
 
+// errCodeUsageLimit is the provider error code of an exhausted usage limit.
+const errCodeUsageLimit = "usageLimitExceeded"
+
 type agentMapCreator map[string]agent.Agent
 
 func (c agentMapCreator) CreateAgent(_ context.Context, name string, _ AgentRequest) (agent.Agent, error) {
@@ -97,7 +100,7 @@ func runPool(t *testing.T, pool *PoolAgent) []*session.Event {
 }
 
 func TestPoolFailsOverOnProviderErrorEvent(t *testing.T) {
-	codex := &scriptedMember{name: "codex", errorCode: "usageLimitExceeded"}
+	codex := &scriptedMember{name: "codex", errorCode: errCodeUsageLimit}
 	glm := &scriptedMember{name: "glm"}
 	pool, _, _ := newScriptedPool(codex, glm)
 
@@ -266,7 +269,7 @@ func TestPoolDoesNotReplayAfterToolEvent(t *testing.T) {
 }
 
 func TestPoolSkipsCoolingMemberThenReturnsToPrimary(t *testing.T) {
-	codex := &scriptedMember{name: "codex", errorCode: "usageLimitExceeded"}
+	codex := &scriptedMember{name: "codex", errorCode: errCodeUsageLimit}
 	glm := &scriptedMember{name: "glm"}
 	pool, _, clock := newScriptedPool(codex, glm)
 
@@ -285,7 +288,7 @@ func TestPoolSkipsCoolingMemberThenReturnsToPrimary(t *testing.T) {
 }
 
 func TestPoolSurfacesErrorWhenEveryMemberFails(t *testing.T) {
-	codex := &scriptedMember{name: "codex", errorCode: "usageLimitExceeded"}
+	codex := &scriptedMember{name: "codex", errorCode: errCodeUsageLimit}
 	glm := &scriptedMember{name: "glm", errorCode: "rateLimited"}
 	pool, _, _ := newScriptedPool(codex, glm)
 
@@ -503,7 +506,7 @@ func (m *partialThenErrorMember) Run(agent.InvocationContext) iter.Seq2[*session
 			return
 		}
 		failed := &session.Event{}
-		failed.LLMResponse = model.LLMResponse{ErrorCode: "usageLimitExceeded", ErrorMessage: "limit"}
+		failed.LLMResponse = model.LLMResponse{ErrorCode: errCodeUsageLimit, ErrorMessage: "limit"}
 		yield(failed, nil)
 	}
 }
@@ -534,7 +537,7 @@ func TestPoolProviderErrorAfterOutputStartsCooldownWithoutRerun(t *testing.T) {
 		}
 		events = append(events, ev)
 	}
-	if len(events) != 2 || events[1].ErrorCode != "usageLimitExceeded" {
+	if len(events) != 2 || events[1].ErrorCode != errCodeUsageLimit {
 		t.Fatalf("want the partial text and then the provider error, got %d events", len(events))
 	}
 	if second.runs != 0 {
@@ -589,7 +592,7 @@ func (c *closableCreator) CreateAgent(_ context.Context, name string, _ AgentReq
 }
 
 func TestPoolSurfacesProviderErrorWhenNoMemberIsLeft(t *testing.T) {
-	creator := &closableCreator{spec: map[string]string{"a": "usageLimitExceeded", "b": "usageLimitExceeded"}}
+	creator := &closableCreator{spec: map[string]string{"a": errCodeUsageLimit, "b": errCodeUsageLimit}}
 	executor := NewPoolExecutor("pool", []MemberConfig{{Name: "a"}, {Name: "b"}}, creator, AgentRequest{})
 	executor.startCooldown("a")
 	pool := &PoolAgent{executor: executor}
@@ -601,13 +604,13 @@ func TestPoolSurfacesProviderErrorWhenNoMemberIsLeft(t *testing.T) {
 		}
 		last = ev
 	}
-	if last == nil || last.ErrorCode != "usageLimitExceeded" {
+	if last == nil || last.ErrorCode != errCodeUsageLimit {
 		t.Fatalf("want the usage limit event, got %+v", last)
 	}
 }
 
 func TestPoolClosesFailedAndReplacedMembers(t *testing.T) {
-	creator := &closableCreator{spec: map[string]string{"primary": "usageLimitExceeded"}}
+	creator := &closableCreator{spec: map[string]string{"primary": errCodeUsageLimit}}
 	executor := NewPoolExecutor("pool", []MemberConfig{{Name: "primary"}, {Name: "fallback"}}, creator, AgentRequest{})
 	clock := time.Now()
 	executor.now = func() time.Time { return clock }
@@ -769,7 +772,7 @@ func (m *concurrentMember) Run(agent.InvocationContext) iter.Seq2[*session.Event
 		time.Sleep(time.Millisecond)
 		ev := &session.Event{}
 		if m.name == "a" {
-			ev.LLMResponse = model.LLMResponse{ErrorCode: "usageLimitExceeded"}
+			ev.LLMResponse = model.LLMResponse{ErrorCode: errCodeUsageLimit}
 		} else {
 			ev.Content = genai.NewContentFromText("ok", genai.RoleModel)
 		}
@@ -784,7 +787,7 @@ func (c *concurrentCreator) CreateAgent(_ context.Context, name string, _ AgentR
 }
 
 func TestPoolEventsAreAuthoredByThePool(t *testing.T) {
-	codex := &scriptedMember{name: "codex", errorCode: "usageLimitExceeded"}
+	codex := &scriptedMember{name: "codex", errorCode: errCodeUsageLimit}
 	glm := &scriptedMember{name: "glm"}
 	creator := &namedCreator{members: map[string]*scriptedMember{"codex": codex, "glm": glm}}
 	members := []MemberConfig{{Name: "codex"}, {Name: "glm"}}
@@ -825,7 +828,7 @@ func TestPoolTerminalErrorAfterPartialOutputIsAuthoredByThePool(t *testing.T) {
 			t.Fatalf("event author = %q, want the pool name", ev.Author)
 		}
 	}
-	if events[0].Content == nil || events[1].ErrorCode != "usageLimitExceeded" {
+	if events[0].Content == nil || events[1].ErrorCode != errCodeUsageLimit {
 		t.Fatalf("want text then the terminal error, got %+v / %+v", events[0], events[1])
 	}
 	if second.runs != 0 {
