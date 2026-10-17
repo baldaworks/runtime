@@ -232,6 +232,77 @@ func TestFactoryBuild_NormalizesTemplatedACPCommand(t *testing.T) {
 	assert.Equal(t, want, capturedCommand)
 }
 
+func TestFactoryBuild_ResolvesACPEnvironmentFromFactorySnapshot(t *testing.T) {
+	origNewACPAgent := newACPAgent
+	t.Cleanup(func() {
+		newACPAgent = origNewACPAgent
+	})
+
+	var captured [][]string
+	newACPAgent = func(cfg acpagent.Config) (agent.Agent, error) {
+		captured = append(captured, append([]string(nil), cfg.Environment...))
+		return nil, nil
+	}
+
+	base := []string{"ZED=base", "SHARED=base", "ALPHA=base"}
+	f := New(map[string]agentconfig.Config{
+		"acp": {
+			Type: agentconfig.AgentTypeGenericACP,
+			GenericACP: &agentconfig.ACPConfig{
+				Cmd: helperACPCommand(t),
+				Env: map[string]string{
+					"SHARED": "override",
+					"EMPTY":  "",
+				},
+			},
+		},
+	}, mcpregistry.New(nil), withProcessEnvironment(base))
+
+	base[0] = "ZED=mutated"
+	for range 2 {
+		_, err := f.Build(context.Background(), BuildRequest{AgentID: "acp", WorkingDirectory: t.TempDir()})
+		if err != nil {
+			t.Fatalf("Build() error = %v", err)
+		}
+	}
+
+	want := []string{"ALPHA=base", "EMPTY=", "SHARED=override", "ZED=base"}
+	assert.Equal(t, [][]string{want, want}, captured)
+}
+
+func TestFactoryBuild_ACPEnvironmentCanDisableInheritance(t *testing.T) {
+	origNewACPAgent := newACPAgent
+	t.Cleanup(func() {
+		newACPAgent = origNewACPAgent
+	})
+
+	var captured []string
+	newACPAgent = func(cfg acpagent.Config) (agent.Agent, error) {
+		captured = cfg.Environment
+		return nil, nil
+	}
+
+	inherit := false
+	f := New(map[string]agentconfig.Config{
+		"acp": {
+			Type: agentconfig.AgentTypeGenericACP,
+			GenericACP: &agentconfig.ACPConfig{
+				Cmd:        helperACPCommand(t),
+				InheritEnv: &inherit,
+			},
+		},
+	}, mcpregistry.New(nil), withProcessEnvironment([]string{"SECRET=must-not-leak"}))
+
+	_, err := f.Build(context.Background(), BuildRequest{AgentID: "acp", WorkingDirectory: t.TempDir()})
+	if err != nil {
+		t.Fatalf("Build() error = %v", err)
+	}
+	if captured == nil {
+		t.Fatal("ACP environment = nil, want explicit empty environment")
+	}
+	assert.Empty(t, captured)
+}
+
 func TestFactoryBuild_PropagatesACPReasoningEffort(t *testing.T) {
 	origNewACPAgent := newACPAgent
 	t.Cleanup(func() {
