@@ -2,6 +2,7 @@ package appconfig
 
 import (
 	"bytes"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/go-viper/mapstructure/v2"
 	"github.com/spf13/viper"
+	"gopkg.in/yaml.v3"
 )
 
 const (
@@ -19,6 +21,7 @@ const (
 	runtimeRootKey     = "runtime"
 	overridesRootKey   = "profiles"
 	defaultProfileName = "default"
+	preservedMapKeyTag = "__runtime_exact_key_"
 )
 
 // RuntimeLoadOptions configures runtime config loading.
@@ -121,7 +124,7 @@ func LoadResolvedSettings(runtimeOpts RuntimeLoadOptions, opts AppLoadOptions) (
 		settings = map[string]any{}
 	}
 
-	return settings, selectedProfile, nil
+	return restoreEnvironmentMapKeys(settings), selectedProfile, nil
 }
 
 func loadConfigViper(configPath string, defaultsYAML []byte) (*viper.Viper, error) {
@@ -129,7 +132,11 @@ func loadConfigViper(configPath string, defaultsYAML []byte) (*viper.Viper, erro
 	v.SetConfigType("yaml")
 
 	if len(defaultsYAML) > 0 {
-		if err := v.ReadConfig(bytes.NewReader(defaultsYAML)); err != nil {
+		preservedDefaults, err := preserveEnvironmentMapKeys(defaultsYAML)
+		if err != nil {
+			return nil, fmt.Errorf("preserve yaml map keys in embedded defaults: %w", err)
+		}
+		if err := v.ReadConfig(bytes.NewReader(preservedDefaults)); err != nil {
 			return nil, fmt.Errorf("parse yaml in embedded defaults: %w", err)
 		}
 	}
@@ -145,18 +152,86 @@ func loadConfigViper(configPath string, defaultsYAML []byte) (*viper.Viper, erro
 	if err != nil {
 		return nil, fmt.Errorf("expand config file %q: %w", configPath, err)
 	}
+	preservedContent, err := preserveEnvironmentMapKeys([]byte(expandedContent))
+	if err != nil {
+		return nil, fmt.Errorf("preserve yaml map keys in config file %q: %w", configPath, err)
+	}
 
 	if len(defaultsYAML) > 0 {
-		if err := v.MergeConfig(bytes.NewReader([]byte(expandedContent))); err != nil {
+		if err := v.MergeConfig(bytes.NewReader(preservedContent)); err != nil {
 			return nil, fmt.Errorf("parse config file %q: %w", configPath, err)
 		}
 	} else {
-		if err := v.ReadConfig(bytes.NewReader([]byte(expandedContent))); err != nil {
+		if err := v.ReadConfig(bytes.NewReader(preservedContent)); err != nil {
 			return nil, fmt.Errorf("parse config file %q: %w", configPath, err)
 		}
 	}
 
 	return v, nil
+}
+
+func preserveEnvironmentMapKeys(content []byte) ([]byte, error) {
+	if len(bytes.TrimSpace(content)) == 0 {
+		return content, nil
+	}
+	var document yaml.Node
+	if err := yaml.Unmarshal(content, &document); err != nil {
+		return nil, err
+	}
+	preserveEnvironmentNodeKeys(&document)
+	return yaml.Marshal(&document)
+}
+
+func preserveEnvironmentNodeKeys(node *yaml.Node) {
+	if node.Kind == yaml.MappingNode {
+		for i := 0; i+1 < len(node.Content); i += 2 {
+			key, value := node.Content[i], node.Content[i+1]
+			if key.Value == "env" && value.Kind == yaml.MappingNode {
+				for j := 0; j+1 < len(value.Content); j += 2 {
+					environmentKey := value.Content[j]
+					environmentKey.Value = preservedMapKeyTag + hex.EncodeToString([]byte(environmentKey.Value))
+				}
+			}
+			preserveEnvironmentNodeKeys(value)
+		}
+		return
+	}
+	for _, child := range node.Content {
+		preserveEnvironmentNodeKeys(child)
+	}
+}
+
+func restoreEnvironmentMapKeys(settings map[string]any) map[string]any {
+	restored, _ := restoreEnvironmentValue(settings, false).(map[string]any)
+	return restored
+}
+
+func restoreEnvironmentValue(value any, environmentMap bool) any {
+	mapping, ok := toStringAnyMap(value)
+	if !ok {
+		return value
+	}
+	restored := make(map[string]any, len(mapping))
+	for key, child := range mapping {
+		restoredKey := key
+		if environmentMap {
+			restoredKey = restorePreservedMapKey(key)
+		}
+		restored[restoredKey] = restoreEnvironmentValue(child, key == "env")
+	}
+	return restored
+}
+
+func restorePreservedMapKey(key string) string {
+	encoded, ok := strings.CutPrefix(key, preservedMapKeyTag)
+	if !ok {
+		return key
+	}
+	decoded, err := hex.DecodeString(encoded)
+	if err != nil {
+		return key
+	}
+	return string(decoded)
 }
 
 func applyProfileOverlay(v *viper.Viper, settings map[string]any, requestedProfile string) (string, error) {
@@ -370,12 +445,21 @@ func applyAppEnvOverrides(v *viper.Viper, appName string, envPrefix string) {
 
 	for _, section := range sections {
 		for _, key := range leafPaths(section.data, "") {
-			if !envViper.IsSet(key) {
+			lookupKey := restorePreservedPath(key)
+			if !envViper.IsSet(lookupKey) {
 				continue
 			}
-			v.Set(section.name+"."+key, envViper.Get(key))
+			v.Set(section.name+"."+key, envViper.Get(lookupKey))
 		}
 	}
+}
+
+func restorePreservedPath(path string) string {
+	segments := strings.Split(path, ".")
+	for i, segment := range segments {
+		segments[i] = restorePreservedMapKey(segment)
+	}
+	return strings.Join(segments, ".")
 }
 
 func leafPaths(m map[string]any, parent string) []string {
