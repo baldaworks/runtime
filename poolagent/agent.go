@@ -56,20 +56,29 @@ type PoolExecutor struct {
 	pendingErr     error
 	closeOnce      sync.Once
 	closeErr       error
+	cooldowns      map[string]time.Time
+	now            func() time.Time
 }
 
 type ownedPoolMember struct {
 	agent.Agent
 	cancel context.CancelFunc
+	name   string
+	index  int
 }
 
 const poolCloseTimeout = 5 * time.Second
+
+// memberCooldown is how long a member that failed at run time is skipped
+// before the pool probes it again, so the first member can take over again.
+const memberCooldown = 5 * time.Minute
 
 // NewPoolExecutor creates a pool executor for ordered failover across members.
 func NewPoolExecutor(poolName string, members []MemberConfig, agentCreator AgentCreator, req AgentRequest) *PoolExecutor {
 	return &PoolExecutor{
 		poolName:     poolName,
 		members:      members,
+		now:          time.Now,
 		agentCreator: agentCreator,
 		req:          req,
 	}
@@ -114,7 +123,7 @@ func (p *PoolExecutor) member(ctx context.Context) (*ownedPoolMember, error) {
 		p.creationCancel = cancel
 		p.mu.Unlock()
 
-		inner, err := p.createMember(createCtx)
+		inner, idx, err := p.createMember(createCtx)
 		if err != nil {
 			cancel()
 		}
@@ -123,7 +132,7 @@ func (p *PoolExecutor) member(ctx context.Context) (*ownedPoolMember, error) {
 		if !closed {
 			var member *ownedPoolMember
 			if err == nil {
-				member = &ownedPoolMember{Agent: inner, cancel: cancel}
+				member = &ownedPoolMember{Agent: inner, cancel: cancel, name: p.members[idx].Name, index: idx}
 				p.cachedMember = member
 				p.ownedMembers = append(p.ownedMembers, member)
 			}
@@ -150,24 +159,71 @@ func (p *PoolExecutor) member(ctx context.Context) (*ownedPoolMember, error) {
 	}
 }
 
-func (p *PoolExecutor) createMember(ctx context.Context) (agent.Agent, error) {
+// createMember builds the first member that is not cooling down. Members in
+// cooldown are only tried when every other member failed to be created.
+func (p *PoolExecutor) createMember(ctx context.Context) (agent.Agent, int, error) {
 	var lastErr error
 	attemptErrors := make([]AttemptError, 0, len(p.members))
-	for i, member := range p.members {
-		if err := ctx.Err(); err != nil {
-			return nil, err
+	for _, ignoreCooldown := range []bool{false, true} {
+		for i, member := range p.members {
+			if !ignoreCooldown && p.coolingDown(member.Name) {
+				continue
+			}
+			if ignoreCooldown && !p.coolingDown(member.Name) {
+				continue
+			}
+			if err := ctx.Err(); err != nil {
+				return nil, 0, err
+			}
+			req := p.req
+			req.Name = p.poolName + "_" + member.Name
+			inner, err := p.agentCreator.CreateAgent(ctx, member.Name, req)
+			if err != nil {
+				attemptErrors = append(attemptErrors, AttemptError{Member: member.Name, Index: i, Err: fmt.Sprintf("create agent %q: %v", member.Name, err)})
+				lastErr = fmt.Errorf("pool %q: all members failed", p.poolName)
+				continue
+			}
+			return inner, i, nil
 		}
-		req := p.req
-		req.Name = p.poolName + "_" + member.Name
-		inner, err := p.agentCreator.CreateAgent(ctx, member.Name, req)
-		if err != nil {
-			attemptErrors = append(attemptErrors, AttemptError{Member: member.Name, Index: i, Err: fmt.Sprintf("create agent %q: %v", member.Name, err)})
-			lastErr = fmt.Errorf("pool %q: all members failed", p.poolName)
+	}
+	return nil, 0, &AllPoolMembersFailedError{PoolName: p.poolName, MemberNames: p.memberNames(), Errors: attemptErrors, Err: lastErr}
+}
+
+func (p *PoolExecutor) coolingDown(name string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	until, ok := p.cooldowns[name]
+	return ok && p.now().Before(until)
+}
+
+// fail records a run-time failure: the member sits out memberCooldown and is
+// dropped from the cache so the next member is selected.
+func (p *PoolExecutor) fail(member *ownedPoolMember) {
+	p.mu.Lock()
+	if p.cooldowns == nil {
+		p.cooldowns = make(map[string]time.Time)
+	}
+	p.cooldowns[member.name] = p.now().Add(memberCooldown)
+	p.mu.Unlock()
+	p.discard(member)
+}
+
+// refreshPrimary drops a cached fallback member once a higher-priority member
+// finished its cooldown, so the pool returns to the preferred provider.
+func (p *PoolExecutor) refreshPrimary() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.cachedMember == nil || p.cachedMember.index == 0 {
+		return
+	}
+	for i := 0; i < p.cachedMember.index; i++ {
+		until, ok := p.cooldowns[p.members[i].Name]
+		if ok && p.now().Before(until) {
 			continue
 		}
-		return inner, nil
+		p.cachedMember = nil
+		return
 	}
-	return nil, &AllPoolMembersFailedError{PoolName: p.poolName, MemberNames: p.memberNames(), Errors: attemptErrors, Err: lastErr}
 }
 
 func (p *PoolExecutor) memberNames() string {
@@ -294,39 +350,85 @@ func NewPoolAgent(ctx context.Context, poolName string, members []MemberConfig, 
 
 func (p *PoolAgent) run(ctx agent.InvocationContext) iter.Seq2[*session.Event, error] {
 	return func(yield func(*session.Event, error) bool) {
+		p.executor.refreshPrimary()
 		currentMember, err := p.executor.member(ctx)
 		if err != nil {
 			yield(nil, err)
 			return
 		}
 
-		for done := false; !done; {
-			run := currentMember.Run(ctx)
-			retryAgent := false
-			for ev, err := range run {
-				if err != nil {
-					p.executor.discard(currentMember)
-
-					var retryErr error
-					currentMember, retryErr = p.executor.member(ctx)
-					if retryErr != nil {
-						yield(nil, retryErr)
-						return
-					}
-					retryAgent = true
-					break
-				}
-				if !yield(ev, nil) {
-					done = true
-					break
-				}
+		// A single-member pool retries once: recreating the member can recover
+		// from a transient failure, and there is no other member to fall to.
+		maxAttempts := max(len(p.executor.members), 2)
+		for attempt := 1; ; attempt++ {
+			failure := runMember(ctx, currentMember, yield)
+			if failure == nil {
+				return
 			}
-			if retryAgent {
-				continue
+			p.executor.fail(currentMember)
+			if attempt >= maxAttempts {
+				failure.yield(yield)
+				return
 			}
-			return
+			currentMember, err = p.executor.member(ctx)
+			if err != nil {
+				yield(nil, err)
+				return
+			}
 		}
 	}
+}
+
+// memberFailure is the error or provider error event that made a member fail.
+type memberFailure struct {
+	err   error
+	event *session.Event
+}
+
+func (f *memberFailure) yield(yield func(*session.Event, error) bool) {
+	yield(f.event, f.err)
+}
+
+// runMember streams one member. It returns a failure when the member returned
+// an error, or reported a provider error (for example a usage limit) before
+// producing any content, so the pool can fail over without duplicating output.
+// Events without content (such as session state updates) are held back until
+// the member produces content or finishes, so a failed member leaks none.
+func runMember(ctx agent.InvocationContext, member *ownedPoolMember, yield func(*session.Event, error) bool) *memberFailure {
+	var held []*session.Event
+	produced := false
+	for ev, err := range member.Run(ctx) {
+		if err != nil {
+			return &memberFailure{err: err}
+		}
+		if ev != nil && ev.ErrorCode != "" && !produced {
+			return &memberFailure{event: ev}
+		}
+		if !produced && !hasContent(ev) {
+			held = append(held, ev)
+			continue
+		}
+		produced = true
+		for _, h := range held {
+			if !yield(h, nil) {
+				return nil
+			}
+		}
+		held = nil
+		if !yield(ev, nil) {
+			return nil
+		}
+	}
+	for _, h := range held {
+		if !yield(h, nil) {
+			return nil
+		}
+	}
+	return nil
+}
+
+func hasContent(ev *session.Event) bool {
+	return ev != nil && ev.Content != nil && len(ev.Content.Parts) > 0
 }
 
 // Close closes the currently cached pool member.
