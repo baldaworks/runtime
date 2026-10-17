@@ -523,6 +523,7 @@ func NewPoolAgent(ctx context.Context, poolName string, members []MemberConfig, 
 
 func (p *PoolAgent) run(ctx agent.InvocationContext) iter.Seq2[*session.Event, error] {
 	return func(yield func(*session.Event, error) bool) {
+		yield = p.asPoolAuthor(yield)
 		p.executor.refreshPrimary()
 		currentMember, err := p.executor.acquireMember(ctx)
 		if err != nil {
@@ -556,6 +557,23 @@ func (p *PoolAgent) run(ctx agent.InvocationContext) iter.Seq2[*session.Event, e
 				return
 			}
 		}
+	}
+}
+
+// asPoolAuthor presents every event as authored by the pool itself. Members
+// are an implementation detail of the failover, and the session history should
+// read as one agent no matter which member produced a turn; the member names
+// would otherwise show up as separate speakers in the conversation.
+func (p *PoolAgent) asPoolAuthor(yield func(*session.Event, error) bool) func(*session.Event, error) bool {
+	if p.Agent == nil {
+		return yield
+	}
+	name := p.Name()
+	return func(ev *session.Event, err error) bool {
+		if ev != nil {
+			ev.Author = name
+		}
+		return yield(ev, err)
 	}
 }
 
