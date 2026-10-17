@@ -782,3 +782,25 @@ type concurrentCreator struct{ ranClosed atomic.Int32 }
 func (c *concurrentCreator) CreateAgent(_ context.Context, name string, _ AgentRequest) (agent.Agent, error) {
 	return &concurrentMember{name: name, owner: c}, nil
 }
+
+func TestPoolEventsAreAuthoredByThePool(t *testing.T) {
+	codex := &scriptedMember{name: "codex", errorCode: "usageLimitExceeded"}
+	glm := &scriptedMember{name: "glm"}
+	creator := &namedCreator{members: map[string]*scriptedMember{"codex": codex, "glm": glm}}
+	members := []MemberConfig{{Name: "codex"}, {Name: "glm"}}
+	pool, err := NewPoolAgent(context.Background(), "pool", members, AgentRequest{}, creator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = pool.Close() }()
+
+	events := runPool(t, pool)
+	if len(events) == 0 {
+		t.Fatal("no events")
+	}
+	for _, ev := range events {
+		if ev.Author != "pool" {
+			t.Fatalf("event author = %q, want the pool name so member names do not appear as speakers", ev.Author)
+		}
+	}
+}
