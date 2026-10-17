@@ -9,11 +9,40 @@ import (
 	"testing"
 	"time"
 
+	"github.com/normahq/go-adk-acpagent/v2/acperror"
 	"google.golang.org/adk/v2/agent"
 	"google.golang.org/adk/v2/model"
 	"google.golang.org/adk/v2/session"
 	"google.golang.org/genai"
 )
+
+type agentMapCreator map[string]agent.Agent
+
+func (c agentMapCreator) CreateAgent(_ context.Context, name string, _ AgentRequest) (agent.Agent, error) {
+	return c[name], nil
+}
+
+type providerErrorMember struct {
+	agent.Agent
+	providerErr acperror.ProviderError
+	beforeError *session.Event
+	runs        int
+}
+
+func (m *providerErrorMember) Run(agent.InvocationContext) iter.Seq2[*session.Event, error] {
+	return func(yield func(*session.Event, error) bool) {
+		m.runs++
+		if m.beforeError != nil && !yield(m.beforeError, nil) {
+			return
+		}
+		ev := &session.Event{}
+		ev.LLMResponse = model.LLMResponse{ErrorCode: "acp_request_error:-32603", ErrorMessage: "Provider request failed"}
+		ev.CustomMetadata = map[string]any{
+			acperror.ProviderErrorMetadataKey: m.providerErr.Metadata(),
+		}
+		yield(ev, nil)
+	}
+}
 
 type scriptedMember struct {
 	agent.Agent
@@ -83,6 +112,156 @@ func TestPoolFailsOverOnProviderErrorEvent(t *testing.T) {
 	}
 	if codex.runs != 1 || glm.runs != 1 {
 		t.Fatalf("runs codex=%d glm=%d", codex.runs, glm.runs)
+	}
+}
+
+func TestPoolTypedProviderErrorPolicy(t *testing.T) {
+	tests := []struct {
+		name         string
+		kind         acperror.Kind
+		scope        acperror.Scope
+		wantFailover bool
+		wantCooldown bool
+		wantRetired  bool
+	}{
+		{name: "rate limit", kind: acperror.KindRateLimited, scope: acperror.ScopeAccount, wantFailover: true, wantCooldown: true},
+		{name: "unavailable", kind: acperror.KindUnavailable, scope: acperror.ScopeProvider, wantFailover: true, wantCooldown: true},
+		{name: "quota", kind: acperror.KindQuotaExceeded, scope: acperror.ScopeAccount, wantFailover: true, wantCooldown: true},
+		{name: "authentication", kind: acperror.KindAuthenticationRequired, scope: acperror.ScopeAccount, wantFailover: true, wantRetired: true},
+		{name: "payment", kind: acperror.KindPaymentRequired, scope: acperror.ScopeAccount, wantFailover: true, wantRetired: true},
+		{name: "session exhausted", kind: acperror.KindSessionExhausted, scope: acperror.ScopeSession},
+		{name: "invalid request", kind: acperror.KindInvalidRequest, scope: acperror.ScopeRequest},
+		{name: "unknown", kind: acperror.KindUnknown, scope: acperror.ScopeAccount},
+		{name: "health kind with session scope", kind: acperror.KindRateLimited, scope: acperror.ScopeSession},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			primary := &providerErrorMember{providerErr: acperror.ProviderError{Kind: tt.kind, Scope: tt.scope}}
+			fallback := &scriptedMember{name: "fallback"}
+			executor := NewPoolExecutor("pool", []MemberConfig{{Name: "primary"}, {Name: "fallback"}}, agentMapCreator{
+				"primary": primary, "fallback": fallback,
+			}, AgentRequest{})
+			pool := &PoolAgent{executor: executor}
+
+			events := runPool(t, pool)
+			if got := fallback.runs > 0; got != tt.wantFailover {
+				t.Fatalf("fallback used = %t, want %t", got, tt.wantFailover)
+			}
+			if got := executor.coolingDown("primary"); got != tt.wantCooldown {
+				t.Fatalf("cooling down = %t, want %t", got, tt.wantCooldown)
+			}
+			if got := executor.isRetired("primary"); got != tt.wantRetired {
+				t.Fatalf("retired = %t, want %t", got, tt.wantRetired)
+			}
+			if !tt.wantFailover && (len(events) != 1 || events[0].ErrorCode == "") {
+				t.Fatalf("terminal provider error was not returned: %+v", events)
+			}
+		})
+	}
+}
+
+func TestPoolMalformedTypedProviderErrorFailsClosed(t *testing.T) {
+	eventMember := &providerErrorMember{providerErr: acperror.ProviderError{}}
+	fallback := &scriptedMember{name: "fallback"}
+	executor := NewPoolExecutor("pool", []MemberConfig{{Name: "primary"}, {Name: "fallback"}}, agentMapCreator{
+		"primary": eventMember, "fallback": fallback,
+	}, AgentRequest{})
+	pool := &PoolAgent{executor: executor}
+
+	events := runPool(t, pool)
+	if len(events) != 1 || events[0].ErrorCode == "" {
+		t.Fatalf("malformed typed error was not returned: %+v", events)
+	}
+	if fallback.runs != 0 {
+		t.Fatalf("malformed typed error triggered failover: runs=%d", fallback.runs)
+	}
+	if executor.coolingDown("primary") || executor.isRetired("primary") {
+		t.Fatal("malformed typed error changed member health")
+	}
+}
+
+func TestPoolTypedCooldownUsesBoundedRetryAt(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0)
+	tests := []struct {
+		name    string
+		kind    acperror.Kind
+		retryAt *int64
+		want    time.Duration
+	}{
+		{name: "transient default", kind: acperror.KindRateLimited, want: memberCooldown},
+		{name: "quota default", kind: acperror.KindQuotaExceeded, want: quotaCooldown},
+		{name: "future reset", kind: acperror.KindRateLimited, retryAt: int64Ptr(now.Add(2 * time.Hour).Unix()), want: 2 * time.Hour},
+		{name: "near reset bounded", kind: acperror.KindRateLimited, retryAt: int64Ptr(now.Add(time.Second).Unix()), want: minimumRetryCooldown},
+		{name: "far reset bounded", kind: acperror.KindQuotaExceeded, retryAt: int64Ptr(now.Add(7 * 24 * time.Hour).Unix()), want: maximumRetryCooldown},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			failure := &memberFailure{providerErr: &acperror.ProviderError{Kind: tt.kind, RetryAt: tt.retryAt}}
+			if got := failure.cooldownUntil(now).Sub(now); got != tt.want {
+				t.Fatalf("cooldown = %s, want %s", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestPoolCooldownDeadlineNeverMovesEarlier(t *testing.T) {
+	executor := NewPoolExecutor("pool", []MemberConfig{{Name: "primary"}, {Name: "fallback"}}, agentMapCreator{}, AgentRequest{})
+	now := time.Unix(1_800_000_000, 0)
+	executor.now = func() time.Time { return now }
+	long := now.Add(maximumRetryCooldown)
+	executor.startCooldownUntil("primary", long)
+	executor.startCooldownUntil("primary", now.Add(memberCooldown))
+
+	until, cooling := executor.cooldownUntil("primary")
+	if !cooling || !until.Equal(long) {
+		t.Fatalf("cooldown shortened to %s, want %s", until, long)
+	}
+}
+
+func TestSingleMemberTypedTerminalErrorIsNotReplayedAndStartsCooldown(t *testing.T) {
+	member := &providerErrorMember{providerErr: acperror.ProviderError{
+		Kind: acperror.KindRateLimited, Scope: acperror.ScopeAccount,
+	}}
+	executor := NewPoolExecutor("pool", []MemberConfig{{Name: "only"}}, agentMapCreator{"only": member}, AgentRequest{})
+	pool := &PoolAgent{executor: executor}
+
+	events := runPool(t, pool)
+	if member.runs != 1 || len(events) != 1 || events[0].ErrorCode == "" {
+		t.Fatalf("terminal event was replayed or lost: runs=%d events=%+v", member.runs, events)
+	}
+	if !executor.coolingDown("only") {
+		t.Fatal("typed provider cooldown was not applied to a single-member pool")
+	}
+}
+
+func int64Ptr(value int64) *int64 { return &value }
+
+func TestPoolDoesNotReplayAfterToolEvent(t *testing.T) {
+	tool := &session.Event{}
+	tool.Content = &genai.Content{Role: genai.RoleModel, Parts: []*genai.Part{
+		genai.NewPartFromFunctionCall("write_file", map[string]any{"path": "result.txt"}),
+	}}
+	primary := &providerErrorMember{
+		providerErr: acperror.ProviderError{Kind: acperror.KindUnavailable, Scope: acperror.ScopeProvider},
+		beforeError: tool,
+	}
+	fallback := &scriptedMember{name: "fallback"}
+	executor := NewPoolExecutor("pool", []MemberConfig{{Name: "primary"}, {Name: "fallback"}}, agentMapCreator{
+		"primary": primary, "fallback": fallback,
+	}, AgentRequest{})
+	pool := &PoolAgent{executor: executor}
+
+	events := runPool(t, pool)
+	if len(events) != 2 || events[0].Content == nil || events[1].ErrorCode == "" {
+		t.Fatalf("want tool event followed by terminal error, got %+v", events)
+	}
+	if fallback.runs != 0 {
+		t.Fatalf("turn replayed after tool event: fallback runs=%d", fallback.runs)
+	}
+	if !executor.coolingDown("primary") {
+		t.Fatal("provider health cooldown was not applied after the terminal error")
 	}
 }
 
@@ -468,7 +647,7 @@ func TestPoolLateFailureOfReplacedInstanceKeepsReplacementHealthy(t *testing.T) 
 	if _, err := executor.member(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	executor.fail(old)
+	executor.fail(old, &memberFailure{health: memberHealthCooldown})
 	if executor.coolingDown("a") {
 		t.Fatal("a late failure of a replaced instance cooled down its healthy replacement")
 	}

@@ -11,7 +11,7 @@ import (
 func TestCodexACPPackageUsesPinnedDefault(t *testing.T) {
 	t.Parallel()
 
-	if got, want := codexACPPackage(""), "codex-acp@1.10.1"; got != want {
+	if got, want := codexACPPackage(""), "codex-acp@1.11.0"; got != want {
 		t.Fatalf("codexACPPackage(\"\") = %q, want %q", got, want)
 	}
 }

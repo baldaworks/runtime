@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/baldaworks/runtime/v2/agentconfig"
+	"github.com/normahq/go-adk-acpagent/v2/acperror"
 
 	"google.golang.org/adk/v2/agent"
 	"google.golang.org/adk/v2/session"
@@ -57,6 +58,7 @@ type PoolExecutor struct {
 	closeOnce      sync.Once
 	closeErr       error
 	cooldowns      map[string]time.Time
+	retired        map[string]struct{}
 	generations    map[string]int
 	now            func() time.Time
 }
@@ -79,7 +81,12 @@ const poolCloseTimeout = 5 * time.Second
 
 // memberCooldown is how long a member that failed at run time is skipped
 // before the pool probes it again, so the first member can take over again.
-const memberCooldown = 5 * time.Minute
+const (
+	memberCooldown       = 5 * time.Minute
+	quotaCooldown        = time.Hour
+	minimumRetryCooldown = 30 * time.Second
+	maximumRetryCooldown = 24 * time.Hour
+)
 
 // NewPoolExecutor creates a pool executor for ordered failover across members.
 func NewPoolExecutor(poolName string, members []MemberConfig, agentCreator AgentCreator, req AgentRequest) *PoolExecutor {
@@ -198,6 +205,11 @@ func (p *PoolExecutor) createMember(ctx context.Context) (agent.Agent, int, erro
 	var lastErr error
 	attemptErrors := make([]AttemptError, 0, len(p.members))
 	for i, member := range p.members {
+		if p.isRetired(member.Name) {
+			attemptErrors = append(attemptErrors, AttemptError{Member: member.Name, Index: i, Err: "retired until pool recreation"})
+			lastErr = fmt.Errorf("pool %q: all members failed", p.poolName)
+			continue
+		}
 		if until, cooling := p.cooldownUntil(member.Name); cooling {
 			attemptErrors = append(attemptErrors, AttemptError{Member: member.Name, Index: i, Err: fmt.Sprintf("cooling down until %s", until.Format(time.RFC3339))})
 			lastErr = fmt.Errorf("pool %q: all members failed", p.poolName)
@@ -238,18 +250,42 @@ func (p *PoolExecutor) coolingDown(name string) bool {
 	return cooling
 }
 
+func (p *PoolExecutor) isRetired(name string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	_, retired := p.retired[name]
+	return retired
+}
+
 // startCooldown keeps the member out of selection for memberCooldown. A pool
 // with a single member has nothing to fall back to, so it never cools down.
 func (p *PoolExecutor) startCooldown(name string) {
 	if len(p.members) < 2 {
 		return
 	}
+	p.startCooldownUntil(name, p.now().Add(memberCooldown))
+}
+
+func (p *PoolExecutor) startCooldownUntil(name string, until time.Time) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.cooldowns == nil {
 		p.cooldowns = make(map[string]time.Time)
 	}
-	p.cooldowns[name] = p.now().Add(memberCooldown)
+	if current := p.cooldowns[name]; current.After(until) {
+		return
+	}
+	p.cooldowns[name] = until
+}
+
+func (p *PoolExecutor) retireMember(name string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.retired == nil {
+		p.retired = make(map[string]struct{})
+	}
+	p.retired[name] = struct{}{}
+	delete(p.cooldowns, name)
 }
 
 func (p *PoolExecutor) clearCooldown(name string) {
@@ -258,17 +294,30 @@ func (p *PoolExecutor) clearCooldown(name string) {
 	delete(p.cooldowns, name)
 }
 
-// fail records a run-time failure: the member sits out memberCooldown and is
-// dropped from the cache so the next member is selected. A failure of an
-// instance that was already replaced does not cool down its replacement.
-func (p *PoolExecutor) fail(member *ownedPoolMember) {
+// fail applies the health action chosen independently from turn failover. A
+// failure of an instance that was already replaced does not penalize its
+// replacement.
+func (p *PoolExecutor) fail(member *ownedPoolMember, failure *memberFailure) {
 	p.mu.Lock()
 	current := p.generations[member.name] == member.generation
 	p.mu.Unlock()
-	if current {
-		p.startCooldown(member.name)
+	if !current {
+		p.discard(member)
+		return
 	}
-	p.discard(member)
+	switch failure.health {
+	case memberHealthCooldown:
+		if failure.providerErr == nil {
+			p.startCooldown(member.name)
+		} else {
+			p.startCooldownUntil(member.name, failure.cooldownUntil(p.now()))
+		}
+		p.discard(member)
+	case memberHealthRetire:
+		p.retireMember(member.name)
+		p.discard(member)
+	case memberHealthNone:
+	}
 }
 
 // refreshPrimary drops a cached fallback member once the cooldown of a
@@ -282,6 +331,9 @@ func (p *PoolExecutor) refreshPrimary() {
 		return
 	}
 	for i := 0; i < p.cachedMember.index; i++ {
+		if _, retired := p.retired[p.members[i].Name]; retired {
+			continue
+		}
 		until, ok := p.cooldowns[p.members[i].Name]
 		if ok && !p.now().Before(until) {
 			member := p.cachedMember
@@ -491,10 +543,10 @@ func (p *PoolAgent) run(ctx agent.InvocationContext) iter.Seq2[*session.Event, e
 				failure.yield(yield)
 				return
 			}
-			p.executor.fail(currentMember)
+			p.executor.fail(currentMember, failure)
 			// Output already reached the consumer, so rerunning the turn on
 			// another member would duplicate it.
-			if failure.afterOutput || attempt >= maxAttempts {
+			if failure.afterOutput || !failure.failover || attempt >= maxAttempts || (failure.event != nil && len(p.executor.members) == 1) {
 				failure.yield(yield)
 				return
 			}
@@ -514,12 +566,67 @@ func (p *PoolAgent) runAcquired(ctx agent.InvocationContext, member *ownedPoolMe
 	return runMember(ctx, member, yield)
 }
 
-// memberFailure is the error or provider error event that made a member fail.
+// memberFailure is the error or provider error event that ended a member run,
+// plus the independent replay and member-health decisions derived from it.
 type memberFailure struct {
 	err   error
 	event *session.Event
 	// afterOutput reports that the member already produced content.
 	afterOutput bool
+	failover    bool
+	health      memberHealthAction
+	providerErr *acperror.ProviderError
+}
+
+type memberHealthAction uint8
+
+const (
+	memberHealthNone memberHealthAction = iota
+	memberHealthCooldown
+	memberHealthRetire
+)
+
+func (f *memberFailure) cooldownUntil(now time.Time) time.Time {
+	duration := memberCooldown
+	if f.providerErr != nil && f.providerErr.Kind == acperror.KindQuotaExceeded {
+		duration = quotaCooldown
+	}
+	if f.providerErr == nil || f.providerErr.RetryAt == nil {
+		return now.Add(duration)
+	}
+	retryAt := time.Unix(*f.providerErr.RetryAt, 0)
+	if !retryAt.After(now) {
+		return now.Add(duration)
+	}
+	duration = retryAt.Sub(now)
+	duration = max(duration, minimumRetryCooldown)
+	duration = min(duration, maximumRetryCooldown)
+	return now.Add(duration)
+}
+
+func classifyMemberFailure(ev *session.Event) (bool, memberHealthAction, *acperror.ProviderError) {
+	if ev == nil || ev.ErrorCode == "" {
+		return false, memberHealthNone, nil
+	}
+	providerErr, typed := acperror.FromADKMetadata(ev.CustomMetadata)
+	if !typed {
+		if _, present := ev.CustomMetadata[acperror.ProviderErrorMetadataKey]; present {
+			return false, memberHealthNone, nil
+		}
+		return true, memberHealthCooldown, nil
+	}
+	healthScope := providerErr.Scope == acperror.ScopeAccount || providerErr.Scope == acperror.ScopeProvider
+	if !healthScope {
+		return false, memberHealthNone, providerErr
+	}
+	switch providerErr.Kind {
+	case acperror.KindAuthenticationRequired, acperror.KindPaymentRequired:
+		return true, memberHealthRetire, providerErr
+	case acperror.KindQuotaExceeded, acperror.KindRateLimited, acperror.KindUnavailable:
+		return true, memberHealthCooldown, providerErr
+	default:
+		return false, memberHealthNone, providerErr
+	}
 }
 
 func (f *memberFailure) yield(yield func(*session.Event, error) bool) {
@@ -539,9 +646,9 @@ func (f *memberFailure) yieldWithCause(yield func(*session.Event, error) bool, s
 
 // runMember streams one member. It returns a failure when the member returned
 // an error, or reported a provider error (for example a usage limit) before
-// producing any content, so the pool can fail over without duplicating output.
+// producing any content, so policy can fail over without duplicating output.
 // An error or provider error after content was produced is reported with
-// afterOutput set: the turn is not rerun, but the member still fails.
+// afterOutput set: the turn is not rerun, but its health action still applies.
 // Events without content (such as session state updates) are held back until
 // the member produces content or finishes, so a failed member leaks none.
 func runMember(ctx agent.InvocationContext, member *ownedPoolMember, yield func(*session.Event, error) bool) *memberFailure {
@@ -549,10 +656,14 @@ func runMember(ctx agent.InvocationContext, member *ownedPoolMember, yield func(
 	produced := false
 	for ev, err := range member.Run(ctx) {
 		if err != nil {
-			return &memberFailure{err: err, afterOutput: produced}
+			return &memberFailure{err: err, afterOutput: produced, failover: true, health: memberHealthCooldown}
 		}
 		if ev != nil && ev.ErrorCode != "" {
-			return &memberFailure{event: ev, afterOutput: produced}
+			failover, health, providerErr := classifyMemberFailure(ev)
+			return &memberFailure{
+				event: ev, afterOutput: produced, failover: failover,
+				health: health, providerErr: providerErr,
+			}
 		}
 		if !produced && !hasContent(ev) {
 			held = append(held, ev)
