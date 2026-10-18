@@ -585,11 +585,26 @@ func (p *PoolAgent) asPoolAuthor(yield func(*session.Event, error) bool) func(*s
 	}
 	name := p.Name()
 	return func(ev *session.Event, err error) bool {
-		if ev != nil {
+		if ev != nil && !hasToolExchange(ev) {
 			ev.Author = name
 		}
 		return yield(ev, err)
 	}
+}
+
+// hasToolExchange reports events whose author ADK uses to route tool results
+// and rebuild the member's model history. Rewriting these events as the pool
+// makes the member see its own tool call as another agent's message.
+func hasToolExchange(ev *session.Event) bool {
+	if ev == nil || ev.Content == nil {
+		return false
+	}
+	for _, part := range ev.Content.Parts {
+		if part != nil && (part.FunctionCall != nil || part.FunctionResponse != nil) {
+			return true
+		}
+	}
+	return false
 }
 
 // runAcquired runs a member selected with acquireMember and always releases it,
