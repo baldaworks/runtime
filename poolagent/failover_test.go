@@ -788,11 +788,12 @@ func (c *concurrentCreator) CreateAgent(_ context.Context, name string, _ AgentR
 }
 
 func TestPoolEventsAreAuthoredByThePool(t *testing.T) {
+	const poolName = "pool"
 	codex := &scriptedMember{name: "codex", errorCode: errCodeUsageLimit}
 	glm := &scriptedMember{name: "glm"}
 	creator := &namedCreator{members: map[string]*scriptedMember{"codex": codex, "glm": glm}}
 	members := []MemberConfig{{Name: "codex"}, {Name: "glm"}}
-	pool, err := NewPoolAgent(context.Background(), "pool", members, AgentRequest{}, creator)
+	pool, err := NewPoolAgent(context.Background(), poolName, members, AgentRequest{}, creator)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -803,18 +804,19 @@ func TestPoolEventsAreAuthoredByThePool(t *testing.T) {
 		t.Fatal("no events")
 	}
 	for _, ev := range events {
-		if ev.Author != "pool" {
+		if ev.Author != poolName {
 			t.Fatalf("event author = %q, want the pool name so member names do not appear as speakers", ev.Author)
 		}
 	}
 }
 
 func TestPoolTerminalErrorAfterPartialOutputIsAuthoredByThePool(t *testing.T) {
+	const poolName = "pool"
 	first := &partialThenErrorMember{}
 	second := &scriptedMember{name: "second"}
 	creator := &partialCreator{first: first, second: second}
 	members := []MemberConfig{{Name: "first"}, {Name: "second"}}
-	pool, err := NewPoolAgent(context.Background(), "pool", members, AgentRequest{}, creator)
+	pool, err := NewPoolAgent(context.Background(), poolName, members, AgentRequest{}, creator)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -825,7 +827,7 @@ func TestPoolTerminalErrorAfterPartialOutputIsAuthoredByThePool(t *testing.T) {
 		t.Fatalf("want the partial text and the terminal provider error, got %d events", len(events))
 	}
 	for _, ev := range events {
-		if ev.Author != "pool" {
+		if ev.Author != poolName {
 			t.Fatalf("event author = %q, want the pool name", ev.Author)
 		}
 	}
@@ -834,6 +836,34 @@ func TestPoolTerminalErrorAfterPartialOutputIsAuthoredByThePool(t *testing.T) {
 	}
 	if second.runs != 0 {
 		t.Fatalf("the turn was rerun on another member after output: runs=%d", second.runs)
+	}
+}
+
+func TestPoolPreservesMemberAuthorForToolExchange(t *testing.T) {
+	const poolName = "pool"
+	tool := &session.Event{Author: "primary"}
+	tool.Content = &genai.Content{Role: genai.RoleModel, Parts: []*genai.Part{
+		genai.NewPartFromFunctionCall("write_file", map[string]any{"path": "result.txt"}),
+	}}
+	primary := &providerErrorMember{
+		providerErr: acperror.ProviderError{Kind: acperror.KindUnavailable, Scope: acperror.ScopeProvider},
+		beforeError: tool,
+	}
+	pool, err := NewPoolAgent(context.Background(), poolName, []MemberConfig{{Name: "primary"}}, AgentRequest{}, agentMapCreator{"primary": primary})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = pool.Close() }()
+
+	events := runPool(t, pool)
+	if len(events) != 2 {
+		t.Fatalf("want tool call and terminal error, got %d events", len(events))
+	}
+	if events[0].Author != "primary" {
+		t.Fatalf("tool event author = %q, want member name for ADK routing", events[0].Author)
+	}
+	if events[1].Author != poolName {
+		t.Fatalf("terminal event author = %q, want pool name", events[1].Author)
 	}
 }
 
