@@ -21,6 +21,9 @@ func TestBuiltinDriverRegistryDescriptorsAndAliases(t *testing.T) {
 			t.Fatalf("duplicate canonical descriptor %q", descriptor.Type)
 		}
 		seen[descriptor.Type] = struct{}{}
+		if descriptor.ContractVersion == 0 {
+			t.Fatalf("descriptor %q contract version = 0", descriptor.Type)
+		}
 		canonical, ok := BuiltinDriverRegistry().Lookup(descriptor.Type)
 		if !ok {
 			t.Fatalf("Lookup(%q) failed", descriptor.Type)
@@ -32,6 +35,9 @@ func TestBuiltinDriverRegistryDescriptorsAndAliases(t *testing.T) {
 			}
 			if aliased.Type != canonical.Type {
 				t.Errorf("alias %q resolved to %q, want %q", alias, aliased.Type, canonical.Type)
+			}
+			if aliased.ContractVersion != canonical.ContractVersion {
+				t.Errorf("alias %q contract version = %d, want %d", alias, aliased.ContractVersion, canonical.ContractVersion)
 			}
 		}
 	}
@@ -47,7 +53,7 @@ func TestBuiltinDriverRegistryDescriptorsAndAliases(t *testing.T) {
 func TestNewDriverRegistryRejectsDuplicateKeys(t *testing.T) {
 	registration := func(agentType string, aliases ...string) driverRegistration {
 		return driverRegistration{
-			descriptor:   DriverDescriptor{Type: agentType, Aliases: aliases},
+			descriptor:   DriverDescriptor{Type: agentType, Aliases: aliases, ContractVersion: 1},
 			blockPresent: func(Config) bool { return true },
 			blockValid:   func(Config) bool { return true },
 			blockError:   func(Config, string) string { return "" },
@@ -80,6 +86,21 @@ func TestNewDriverRegistryRejectsDuplicateKeys(t *testing.T) {
 				t.Fatal("newDriverRegistry() error = nil, want duplicate-key error")
 			}
 		})
+	}
+}
+
+func TestNewDriverRegistryRejectsZeroContractVersion(t *testing.T) {
+	_, err := newDriverRegistry([]driverRegistration{{
+		descriptor:   DriverDescriptor{Type: "test"},
+		blockPresent: func(Config) bool { return true },
+		blockValid:   func(Config) bool { return true },
+		blockError:   func(Config, string) string { return "" },
+		resolve: func(_ Config, resolved ResolvedConfig, _ string) (ResolvedConfig, error) {
+			return resolved, nil
+		},
+	}})
+	if err == nil || !strings.Contains(err.Error(), "contract version") {
+		t.Fatalf("newDriverRegistry() error = %v, want contract version error", err)
 	}
 }
 

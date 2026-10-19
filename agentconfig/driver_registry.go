@@ -35,11 +35,15 @@ const (
 
 // DriverDescriptor is the passive public description of a built-in provider driver.
 type DriverDescriptor struct {
-	Type                    string
-	Aliases                 []string
-	Class                   DriverClass
-	ConfigBlock             string
-	BackendType             string
+	Type        string
+	Aliases     []string
+	Class       DriverClass
+	ConfigBlock string
+	BackendType string
+	// ContractVersion identifies the persisted configuration contract for this
+	// canonical driver. It changes only when an older stored definition can no
+	// longer be reconstructed and normalized with the same semantics.
+	ContractVersion         uint32
 	ImmutableIdentityFields []string
 	SupportsEnvironment     bool
 	ExecutableSource        CapabilitySource
@@ -113,6 +117,9 @@ func newDriverRegistry(registrations []driverRegistration) (*DriverRegistry, err
 		registration.descriptor.Type = strings.TrimSpace(registration.descriptor.Type)
 		if registration.descriptor.Type == "" {
 			return nil, fmt.Errorf("provider driver type must not be empty")
+		}
+		if registration.descriptor.ContractVersion == 0 {
+			return nil, fmt.Errorf("provider driver %q contract version must not be zero", registration.descriptor.Type)
 		}
 		if registration.resolve == nil || registration.blockPresent == nil || registration.blockValid == nil || registration.blockError == nil {
 			return nil, fmt.Errorf("provider driver %q is incomplete", registration.descriptor.Type)
@@ -364,6 +371,9 @@ func builtinDriverRegistrations() []driverRegistration {
 }
 
 func applyDescriptorDefaults(descriptor *DriverDescriptor) {
+	if descriptor.ContractVersion == 0 {
+		descriptor.ContractVersion = 1
+	}
 	if descriptor.BackendType == "" {
 		descriptor.BackendType = descriptor.Type
 	}
