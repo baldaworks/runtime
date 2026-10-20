@@ -2,19 +2,50 @@ package agentfactory
 
 import (
 	"sort"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/normahq/go-adk-acpagent/v2"
 	"google.golang.org/adk/v2/agent"
 	"google.golang.org/adk/v2/model"
+	"google.golang.org/adk/v2/tool"
 	"google.golang.org/adk/v2/tool/mcptoolset"
 
 	"github.com/baldaworks/runtime/v2/agentconfig"
+	"github.com/baldaworks/runtime/v2/hostedagent"
+	"github.com/baldaworks/runtime/v2/mcpregistry"
 )
+
+// buildHostedToolsets exercises common selection and hosted transport creation
+// through the production factory, without contacting a model or MCP server.
+func buildHostedToolsets(t *testing.T, configs map[string]agentconfig.MCPServerConfig) ([]tool.Toolset, error) {
+	t.Helper()
+	originalModel, originalHosted := newOpenAIModel, newHostedAgent
+	t.Cleanup(func() { newOpenAIModel, newHostedAgent = originalModel, originalHosted })
+	newOpenAIModel = func(string, string, time.Duration, string) (model.LLM, error) {
+		return fakeHostedModel{name: "selection-model"}, nil
+	}
+	var toolsets []tool.Toolset
+	newHostedAgent = func(cfg hostedagent.Config) (agent.Agent, error) {
+		toolsets = cfg.Toolsets
+		return nil, nil
+	}
+	ids := make([]string, 0, len(configs))
+	for id := range configs {
+		ids = append(ids, id)
+	}
+	f := New(map[string]agentconfig.Config{
+		"hosted": {Type: agentconfig.AgentTypeOpenAI, OpenAI: &agentconfig.LocalAPIConfig{APIKey: "selection-key", Model: "selection-model"}, MCPServers: ids},
+	}, mcpregistry.New(configs))
+	_, err := f.Build(t.Context(), BuildRequest{AgentID: "hosted", WorkingDirectory: t.TempDir()})
+	return toolsets, err
+}
 
 // recordTransportEndpoints swaps the transport factory for one that records the
 // endpoint of every config that actually reaches transport construction, so a
-// test asserts on what hostedToolsets did rather than re-deriving the winner.
+// test asserts on what the factory built rather than re-deriving the winner.
 func recordTransportEndpoints(t *testing.T) *[]string {
 	t.Helper()
 	original := mcpTransportFactory
@@ -63,7 +94,7 @@ func TestHostedToolsetsCollapsesScopedEndpointDuplicate(t *testing.T) {
 
 	endpoints := recordTransportEndpoints(t)
 
-	toolsets, _, err := hostedToolsets(nil, resolved)
+	toolsets, err := buildHostedToolsets(t, resolved)
 	if err != nil {
 		t.Fatalf("hostedToolsets: %v", err)
 	}
@@ -101,7 +132,7 @@ func TestDistinctQueryParamsNeverCollapse(t *testing.T) {
 
 	endpoints := recordTransportEndpoints(t)
 
-	toolsets, _, err := hostedToolsets(nil, resolved)
+	toolsets, err := buildHostedToolsets(t, resolved)
 	if err != nil {
 		t.Fatalf("hostedToolsets: %v", err)
 	}
@@ -139,7 +170,7 @@ func TestDistinctHeadersNeverCollapse(t *testing.T) {
 
 	endpoints := recordTransportEndpoints(t)
 
-	toolsets, _, err := hostedToolsets(nil, resolved)
+	toolsets, err := buildHostedToolsets(t, resolved)
 	if err != nil {
 		t.Fatalf("hostedToolsets: %v", err)
 	}
@@ -163,7 +194,7 @@ func TestSameDedupKeyCollapsesThreeEntries(t *testing.T) {
 
 	endpoints := recordTransportEndpoints(t)
 
-	toolsets, _, err := hostedToolsets(nil, resolved)
+	toolsets, err := buildHostedToolsets(t, resolved)
 	if err != nil {
 		t.Fatalf("hostedToolsets: %v", err)
 	}
@@ -206,7 +237,7 @@ func TestDedupPreferredDecidesPlaceholderWinner(t *testing.T) {
 
 	endpoints := recordTransportEndpoints(t)
 
-	toolsets, _, err := hostedToolsets(nil, resolved)
+	toolsets, err := buildHostedToolsets(t, resolved)
 	if err != nil {
 		t.Fatalf("hostedToolsets: %v", err)
 	}
@@ -230,7 +261,7 @@ func TestDedupWithoutPreferenceIsLexicographicallySmallest(t *testing.T) {
 
 	endpoints := recordTransportEndpoints(t)
 
-	toolsets, _, err := hostedToolsets(nil, resolved)
+	toolsets, err := buildHostedToolsets(t, resolved)
 	if err != nil {
 		t.Fatalf("hostedToolsets: %v", err)
 	}
@@ -252,7 +283,7 @@ func TestEmptyDedupKeyNeverCollapses(t *testing.T) {
 
 	endpoints := recordTransportEndpoints(t)
 
-	toolsets, _, err := hostedToolsets(nil, resolved)
+	toolsets, err := buildHostedToolsets(t, resolved)
 	if err != nil {
 		t.Fatalf("hostedToolsets: %v", err)
 	}
@@ -282,7 +313,7 @@ func TestDedupKeyIsOpaque(t *testing.T) {
 	}
 
 	endpoints := recordTransportEndpoints(t)
-	toolsets, _, err := hostedToolsets(nil, resolved)
+	toolsets, err := buildHostedToolsets(t, resolved)
 	if err != nil {
 		t.Fatalf("hostedToolsets: %v", err)
 	}
@@ -314,7 +345,7 @@ func TestHostedToolsetsRejectsMultipleDedupPreferredConfigs(t *testing.T) {
 		},
 	}
 
-	if _, _, err := hostedToolsets(nil, resolved); err == nil {
+	if _, err := buildHostedToolsets(t, resolved); err == nil {
 		t.Fatal("expected multiple preferred configs to be rejected")
 	}
 }
@@ -354,7 +385,7 @@ func TestHostedToolsetsKeepsDistinctEndpoints(t *testing.T) {
 		},
 	}
 
-	toolsets, _, err := hostedToolsets(nil, resolved)
+	toolsets, err := buildHostedToolsets(t, resolved)
 	if err != nil {
 		t.Fatalf("hostedToolsets: %v", err)
 	}
@@ -403,4 +434,53 @@ type stubRequestProcessor struct{}
 
 func (*stubRequestProcessor) ProcessRequest(ctx agent.Context, req *model.LLMRequest) error {
 	return nil
+}
+
+// The ACP constructor must receive the selected scoped endpoint, not both
+// registrations, and ambiguous preferences must fail before starting ACP.
+func TestFactoryBuildACPDedup(t *testing.T) {
+	original := newACPAgent
+	t.Cleanup(func() { newACPAgent = original })
+	for _, conflict := range []bool{false, true} {
+		t.Run(map[bool]string{false: "preferred", true: "conflict"}[conflict], func(t *testing.T) {
+			var captured *acpagent.Config
+			newACPAgent = func(cfg acpagent.Config) (agent.Agent, error) {
+				captured = &cfg
+				return nil, nil
+			}
+			f := New(map[string]agentconfig.Config{
+				"acp": {
+					Type:       agentconfig.AgentTypeGenericACP,
+					GenericACP: &agentconfig.ACPConfig{Cmd: []string{"fixture-acp"}},
+					MCPServers: []string{"zzz-scoped", "aaa-plain"},
+				},
+			}, mcpregistry.New(map[string]agentconfig.MCPServerConfig{
+				"aaa-plain":  {Type: agentconfig.MCPServerTypeHTTP, URL: "https://example.invalid/mcp", DedupKey: "bundled", DedupPreferred: conflict},
+				"zzz-scoped": {Type: agentconfig.MCPServerTypeHTTP, URL: "https://example.invalid/mcp?context=fixture", Headers: map[string]string{"X-Tenant": "scoped-tenant"}, DedupKey: "bundled", DedupPreferred: true},
+			}), WithAvailabilityIndependentMCP())
+			_, err := f.Build(t.Context(), BuildRequest{AgentID: "acp", WorkingDirectory: t.TempDir()})
+			if conflict {
+				if err == nil || !strings.Contains(err.Error(), "multiple preferred configs") {
+					t.Fatalf("Build() error = %v, want conflicting preferences", err)
+				}
+				if captured != nil {
+					t.Fatal("ACP constructed before conflicting preferences were rejected")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if captured == nil {
+				t.Fatal("ACP constructor was not called")
+			}
+			if len(captured.MCPServers) != 1 {
+				t.Fatalf("ACP constructor received %v, want exactly one scoped MCP server", captured.MCPServers)
+			}
+			scoped := captured.MCPServers["zzz-scoped"]
+			if scoped.URL != "https://example.invalid/mcp?context=fixture" || scoped.Headers["X-Tenant"] != "scoped-tenant" {
+				t.Fatalf("selected ACP MCP config = %+v, want original scoped URL and headers", scoped)
+			}
+		})
+	}
 }

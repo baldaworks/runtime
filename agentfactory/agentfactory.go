@@ -258,6 +258,11 @@ func (f *Factory) Build(ctx context.Context, req BuildRequest) (agent.Agent, err
 		return nil, err
 	}
 
+	resolvedMCP, err = selectMCPServers(resolvedMCP)
+	if err != nil {
+		return nil, err
+	}
+
 	ag, err := create(ctx, cfg, req, f, resolvedMCP)
 	if err != nil {
 		return nil, fmt.Errorf("build agent %q: %w", req.AgentID, err)
@@ -403,24 +408,15 @@ func toRuntimeMCPServers(configs map[string]agentconfig.MCPServerConfig) map[str
 	return runtimeConfigs
 }
 
-func hostedToolsets(requestToolsets []tool.Toolset, resolvedMCP map[string]agentconfig.MCPServerConfig, availabilityIndependent ...bool) ([]tool.Toolset, []*ownedMCPTransport, error) {
-	toolsets := append([]tool.Toolset(nil), requestToolsets...)
-	if len(resolvedMCP) == 0 {
-		return toolsets, nil, nil
-	}
-
+// selectMCPServers applies caller-declared equivalence before provider-specific
+// construction, so hosted and ACP agents receive the same effective endpoints.
+func selectMCPServers(resolvedMCP map[string]agentconfig.MCPServerConfig) (map[string]agentconfig.MCPServerConfig, error) {
 	ids := make([]string, 0, len(resolvedMCP))
 	for id := range resolvedMCP {
 		ids = append(ids, id)
 	}
 	sort.Strings(ids)
 
-	// ADK expands every toolset into one flat tool list and packing is not
-	// idempotent: two servers exposing the same tool name abort the turn with
-	// `duplicate tool`. A caller that knowingly registers one server twice
-	// (Balda registers its bundled server plus a session-scoped binding of the
-	// same endpoint) marks both entries with the same DedupKey.
-	//
 	// Equivalence is never inferred from the URL or headers: query parameters
 	// and headers can select a tenant or an authorization context, so two
 	// endpoints that differ that way are distinct servers. Only an explicit,
@@ -442,7 +438,7 @@ func hostedToolsets(requestToolsets []tool.Toolset, resolvedMCP map[string]agent
 			continue
 		}
 		if resolvedMCP[id].DedupPreferred && resolvedMCP[keeper].DedupPreferred {
-			return nil, nil, fmt.Errorf("mcp dedup key %q has multiple preferred configs: %q and %q", key, keeper, id)
+			return nil, fmt.Errorf("mcp dedup key %q has multiple preferred configs: %q and %q", key, keeper, id)
 		}
 		// A preferred entry replaces the current keeper; a preferred keeper is
 		// never displaced.
@@ -454,11 +450,29 @@ func hostedToolsets(requestToolsets []tool.Toolset, resolvedMCP map[string]agent
 		skip[id] = true
 	}
 
+	selected := make(map[string]agentconfig.MCPServerConfig, len(resolvedMCP))
+	for _, id := range ids {
+		if !skip[id] {
+			selected[id] = resolvedMCP[id]
+		}
+	}
+	return selected, nil
+}
+
+func hostedToolsets(requestToolsets []tool.Toolset, resolvedMCP map[string]agentconfig.MCPServerConfig, availabilityIndependent ...bool) ([]tool.Toolset, []*ownedMCPTransport, error) {
+	toolsets := append([]tool.Toolset(nil), requestToolsets...)
+	if len(resolvedMCP) == 0 {
+		return toolsets, nil, nil
+	}
+
+	ids := make([]string, 0, len(resolvedMCP))
+	for id := range resolvedMCP {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+
 	var transports []*ownedMCPTransport
 	for _, id := range ids {
-		if skip[id] {
-			continue
-		}
 		transport, err := mcpTransportFactory(resolvedMCP[id])
 		if err != nil {
 			return nil, nil, errors.Join(fmt.Errorf("create mcp transport %q: %w", id, err), closeMCPTransports(transports))

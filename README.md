@@ -184,7 +184,8 @@ Runtime v2 uses that package internally through `agentfactory`.
   additive and default to off. They replace the earlier behaviour where the
   runtime collapsed MCP endpoints that shared a host and path: query parameters
   and headers can select a tenant or an authorization context, so equivalence is
-  now declared by the caller instead of inferred from the URL.
+  now declared by the caller instead of inferred from the URL. Selection applies
+  before constructing hosted or ACP agents, including pool members.
 
 See [MIGRATION.md](MIGRATION.md) for the local consumer audit.
 
