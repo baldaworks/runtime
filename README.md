@@ -24,6 +24,7 @@ go get github.com/baldaworks/runtime/v2
 ## Packages
 
 - `github.com/baldaworks/runtime/v2/agentconfig`
+- `github.com/baldaworks/runtime/v2/agentproduct`
 - `github.com/baldaworks/runtime/v2/agentfactory`
 - `github.com/baldaworks/runtime/v2/appconfig`
 - `github.com/baldaworks/runtime/v2/hostedagent`
@@ -139,6 +140,12 @@ remain caller-owned. Hosted live/node capabilities and public config stay intact
 Pool shutdown closes all members it created, including failed members retained
 across retries, and fences pending creation. A constructor that ignores cancellation
 returns a shutdown timeout; its late result remains registered for cleanup.
+
+Capability-aware callers use `Factory.BuildProduct`. The returned
+`agentproduct.Product` keeps the executable ADK Agent unchanged and exposes an
+optional exact-session control port. `Product.Close` is the sole lifecycle
+ownership entrypoint: do not close `Product.Agent` directly. Existing `Build`
+callers retain their current Agent ownership behavior.
 
 For `codex_acp`, `bridge_version` accepts an npm version or dist-tag for
 the canonical [`codex-acp`](https://github.com/baldaworks/codex-acp) package;

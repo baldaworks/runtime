@@ -2,6 +2,7 @@
 //
 // The root package is documentation-only. Functional APIs live in subpackages:
 //   - agentconfig for provider and MCP configuration schemas
+//   - agentproduct for provider-neutral runtime ownership and session control
 //   - agentfactory for building runtime agents from validated configuration
 //   - appconfig for loading and validating application config documents
 //   - hostedagent for local API-backed ADK agents

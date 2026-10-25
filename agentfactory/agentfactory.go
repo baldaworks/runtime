@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/baldaworks/runtime/v2/agentconfig"
+	"github.com/baldaworks/runtime/v2/agentproduct"
 	"github.com/baldaworks/runtime/v2/hostedagent"
 	"github.com/baldaworks/runtime/v2/mcpregistry"
 	"github.com/baldaworks/runtime/v2/poolagent"
@@ -226,6 +227,28 @@ func (f *Factory) ValidateAgent(agentID string) error {
 
 // Build creates an agent.Agent instance from request.
 func (f *Factory) Build(ctx context.Context, req BuildRequest) (agent.Agent, error) {
+	return f.build(ctx, req)
+}
+
+// BuildProduct creates an Agent and transfers its lifecycle ownership to a
+// capability-aware product. Callers must close the Product, not Product.Agent.
+// Providers without exact-session control expose a nil Product.Control.
+func (f *Factory) BuildProduct(ctx context.Context, req BuildRequest) (*agentproduct.Product, error) {
+	ag, err := f.build(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	product, err := agentproduct.New(ag, nil)
+	if err != nil {
+		if closer, ok := ag.(io.Closer); ok {
+			return nil, errors.Join(err, closer.Close())
+		}
+		return nil, err
+	}
+	return product, nil
+}
+
+func (f *Factory) build(ctx context.Context, req BuildRequest) (agent.Agent, error) {
 	if f.acpInitializeTimeout < 0 {
 		return nil, fmt.Errorf("acp initialize timeout must not be negative")
 	}
