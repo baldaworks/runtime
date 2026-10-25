@@ -119,7 +119,9 @@ func LoadResolvedSettings(runtimeOpts RuntimeLoadOptions, opts AppLoadOptions) (
 		return nil, "", err
 	}
 
-	applyAppEnvOverrides(v, appName, opts.EnvPrefix)
+	if err := bindAppEnvOverrides(v, appName, opts.EnvPrefix); err != nil {
+		return nil, "", err
+	}
 
 	settings = v.AllSettings()
 	if settings == nil {
@@ -405,32 +407,29 @@ func dedupePaths(paths []string) []string {
 	return out
 }
 
-func applyAppEnvOverrides(v *viper.Viper, appName string, envPrefix string) {
+func bindAppEnvOverrides(v *viper.Viper, appName string, envPrefix string) error {
 	prefix := strings.ToUpper(strings.TrimSpace(envPrefix))
 	if prefix == "" {
 		prefix = strings.ToUpper(strings.TrimSpace(appName))
 	}
 	if prefix == "" {
-		return
+		return nil
 	}
 
-	envViper := viper.New()
-	envViper.SetEnvPrefix(prefix)
-	envViper.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
-	envViper.AutomaticEnv()
-
 	// AllSettings drops null values before env lookup. AllKeys retains their
-	// paths, so an explicit nonempty env value can still override a null leaf.
+	// paths. Bind both sections to the existing app-prefixed env names and let
+	// Viper resolve their values and precedence.
 	for _, path := range v.AllKeys() {
 		section, key, found := strings.Cut(path, ".")
 		if !found || (section != appName && section != runtimeRootKey) {
 			continue
 		}
-		lookupKey := restorePreservedPath(key)
-		if envViper.IsSet(lookupKey) {
-			v.Set(path, envViper.Get(lookupKey))
+		envKey := prefix + "_" + strings.ToUpper(strings.ReplaceAll(restorePreservedPath(key), ".", "_"))
+		if err := v.BindEnv(path, envKey); err != nil {
+			return fmt.Errorf("bind environment override for %q: %w", path, err)
 		}
 	}
+	return nil
 }
 
 func restorePreservedPath(path string) string {
