@@ -145,7 +145,9 @@ Capability-aware callers use `Factory.BuildProduct`. The returned
 `agentproduct.Product` keeps the executable ADK Agent unchanged and exposes an
 optional exact-session control port. `Product.Close` is the sole lifecycle
 ownership entrypoint: do not close `Product.Agent` directly. Existing `Build`
-callers retain their current Agent ownership behavior.
+callers retain their current Agent ownership behavior. Product cleanup failures
+return the bounded `agentproduct.ErrCloseFailed` sentinel without provider or
+MCP error details.
 
 For `codex_acp`, `bridge_version` accepts an npm version or dist-tag for
 the canonical [`codex-acp`](https://github.com/baldaworks/codex-acp) package;

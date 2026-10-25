@@ -20,6 +20,7 @@ import (
 type productTestAgent struct {
 	agent.Agent
 	closes atomic.Int32
+	err    error
 }
 
 type productTestACPAgent struct {
@@ -31,7 +32,7 @@ func (a *productTestACPAgent) SessionControl() *acpagent.SessionController { ret
 
 func (a *productTestAgent) Close() error {
 	a.closes.Add(1)
-	return nil
+	return a.err
 }
 
 func TestBuildProductPreservesAgentAndOwnsClose(t *testing.T) {
