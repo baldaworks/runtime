@@ -86,6 +86,8 @@ func LoadConfigDocument(runtimeOpts RuntimeLoadOptions, opts AppLoadOptions, out
 
 // LoadResolvedSettings loads config defaults, merges the selected file, applies
 // profile overlays and env overrides, and returns the final settings map.
+// Nonempty env values override known app/runtime keys even when YAML sets a
+// leaf to null; empty env values leave the file/profile result unchanged.
 func LoadResolvedSettings(runtimeOpts RuntimeLoadOptions, opts AppLoadOptions) (map[string]any, string, error) {
 	appName := strings.TrimSpace(opts.AppName)
 	if appName == "" {
@@ -412,44 +414,21 @@ func applyAppEnvOverrides(v *viper.Viper, appName string, envPrefix string) {
 		return
 	}
 
-	settings := v.AllSettings()
-	if settings == nil {
-		return
-	}
-
-	sections := []struct {
-		name string
-		data map[string]any
-	}{}
-
-	appSettings, ok := extractAppSection(settings, appName)
-	if ok {
-		sections = append(sections, struct {
-			name string
-			data map[string]any
-		}{appName, appSettings})
-	}
-
-	runtimeSettings, ok := extractAppSection(settings, runtimeRootKey)
-	if ok {
-		sections = append(sections, struct {
-			name string
-			data map[string]any
-		}{runtimeRootKey, runtimeSettings})
-	}
-
 	envViper := viper.New()
 	envViper.SetEnvPrefix(prefix)
 	envViper.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
 	envViper.AutomaticEnv()
 
-	for _, section := range sections {
-		for _, key := range leafPaths(section.data, "") {
-			lookupKey := restorePreservedPath(key)
-			if !envViper.IsSet(lookupKey) {
-				continue
-			}
-			v.Set(section.name+"."+key, envViper.Get(lookupKey))
+	// AllSettings drops null values before env lookup. AllKeys retains their
+	// paths, so an explicit nonempty env value can still override a null leaf.
+	for _, path := range v.AllKeys() {
+		section, key, found := strings.Cut(path, ".")
+		if !found || (section != appName && section != runtimeRootKey) {
+			continue
+		}
+		lookupKey := restorePreservedPath(key)
+		if envViper.IsSet(lookupKey) {
+			v.Set(path, envViper.Get(lookupKey))
 		}
 	}
 }
@@ -460,29 +439,6 @@ func restorePreservedPath(path string) string {
 		segments[i] = restorePreservedMapKey(segment)
 	}
 	return strings.Join(segments, ".")
-}
-
-func leafPaths(m map[string]any, parent string) []string {
-	paths := make([]string, 0)
-	for key, raw := range m {
-		segment := strings.TrimSpace(key)
-		if segment == "" {
-			continue
-		}
-		fullKey := segment
-		if parent != "" {
-			fullKey = parent + "." + segment
-		}
-
-		nested, ok := toStringAnyMap(raw)
-		if !ok || len(nested) == 0 {
-			paths = append(paths, fullKey)
-			continue
-		}
-
-		paths = append(paths, leafPaths(nested, fullKey)...)
-	}
-	return paths
 }
 
 func extractAppSection(doc map[string]any, appName string) (map[string]any, bool) {
