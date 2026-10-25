@@ -238,7 +238,7 @@ func (f *Factory) BuildProduct(ctx context.Context, req BuildRequest) (*agentpro
 	if err != nil {
 		return nil, err
 	}
-	product, err := agentproduct.New(ag, nil)
+	product, err := agentproduct.New(ag, sessionControlForAgent(ag))
 	if err != nil {
 		if closer, ok := ag.(io.Closer); ok {
 			return nil, errors.Join(err, closer.Close())
