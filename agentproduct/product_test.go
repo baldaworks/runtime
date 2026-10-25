@@ -122,18 +122,18 @@ func TestProductCloseFencesControlBeforeAgent(t *testing.T) {
 }
 
 func TestProductCloseReturnsStableError(t *testing.T) {
-	sentinel := errors.New("close failed")
+	sentinel := errors.New("close failed with protected provider detail")
 	ag := newTestAgent(t)
 	ag.err = sentinel
 	product, err := New(ag, nil)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	if err := product.Close(); !errors.Is(err, sentinel) {
-		t.Fatalf("Close error = %v, want %v", err, sentinel)
+	if err := product.Close(); !errors.Is(err, ErrCloseFailed) || errors.Is(err, sentinel) || strings.Contains(err.Error(), "protected") {
+		t.Fatalf("Close error = %v, want bounded sentinel", err)
 	}
-	if err := product.Close(); !errors.Is(err, sentinel) {
-		t.Fatalf("second Close error = %v, want %v", err, sentinel)
+	if err := product.Close(); !errors.Is(err, ErrCloseFailed) || errors.Is(err, sentinel) {
+		t.Fatalf("second Close error = %v, want bounded sentinel", err)
 	}
 }
 

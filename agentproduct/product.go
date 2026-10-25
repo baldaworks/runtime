@@ -14,6 +14,11 @@ import (
 	"google.golang.org/adk/v2/session"
 )
 
+// ErrCloseFailed reports that an owned resource failed to close. Product does
+// not expose the underlying provider error because it may contain protected
+// configuration or remote details.
+var ErrCloseFailed = errors.New("agent product close failed")
+
 // Product owns one immutable executable Agent and its optional session control.
 // Agent and Control are fixed at construction time by convention. Close is the
 // sole ownership entrypoint; callers must not close Agent directly.
@@ -45,7 +50,8 @@ func New(ag agent.Agent, control SessionControl) (*Product, error) {
 }
 
 // Close fences new control calls, waits for admitted calls, and then releases
-// Agent-owned resources exactly once.
+// Agent-owned resources exactly once. Cleanup failures return ErrCloseFailed;
+// provider error details are intentionally not exposed.
 func (p *Product) Close() error {
 	if p == nil {
 		return nil
@@ -55,7 +61,9 @@ func (p *Product) Close() error {
 			p.admission.close()
 		}
 		if p.closeAgent != nil {
-			p.closeErr = errors.Join(p.closeErr, p.closeAgent())
+			if err := p.closeAgent(); err != nil {
+				p.closeErr = ErrCloseFailed
+			}
 		}
 	})
 	return p.closeErr

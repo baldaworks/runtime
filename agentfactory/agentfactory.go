@@ -227,20 +227,24 @@ func (f *Factory) ValidateAgent(agentID string) error {
 
 // Build creates an agent.Agent instance from request.
 func (f *Factory) Build(ctx context.Context, req BuildRequest) (agent.Agent, error) {
-	return f.build(ctx, req)
+	built, err := f.build(ctx, req, false)
+	if err != nil {
+		return nil, err
+	}
+	return built.agent, nil
 }
 
 // BuildProduct creates an Agent and transfers its lifecycle ownership to a
 // capability-aware product. Callers must close the Product, not Product.Agent.
 // Providers without exact-session control expose a nil Product.Control.
 func (f *Factory) BuildProduct(ctx context.Context, req BuildRequest) (*agentproduct.Product, error) {
-	ag, err := f.build(ctx, req)
+	built, err := f.build(ctx, req, true)
 	if err != nil {
 		return nil, err
 	}
-	product, err := agentproduct.New(ag, sessionControlForAgent(ag))
+	product, err := agentproduct.New(built.agent, built.control)
 	if err != nil {
-		if closer, ok := ag.(io.Closer); ok {
+		if closer, ok := built.agent.(io.Closer); ok {
 			return nil, errors.Join(err, closer.Close())
 		}
 		return nil, err
@@ -248,27 +252,32 @@ func (f *Factory) BuildProduct(ctx context.Context, req BuildRequest) (*agentpro
 	return product, nil
 }
 
-func (f *Factory) build(ctx context.Context, req BuildRequest) (agent.Agent, error) {
+type construction struct {
+	agent   agent.Agent
+	control agentproduct.SessionControl
+}
+
+func (f *Factory) build(ctx context.Context, req BuildRequest, withControl bool) (construction, error) {
 	if f.acpInitializeTimeout < 0 {
-		return nil, fmt.Errorf("acp initialize timeout must not be negative")
+		return construction{}, fmt.Errorf("acp initialize timeout must not be negative")
 	}
 	if err := req.Validate(); err != nil {
-		return nil, err
+		return construction{}, err
 	}
 	req.AgentID = strings.TrimSpace(req.AgentID)
 	req.WorkingDirectory = strings.TrimSpace(req.WorkingDirectory)
 
 	schemaCfg, ok := f.registry[req.AgentID]
 	if !ok {
-		return nil, fmt.Errorf("agent %q not found or unsupported", req.AgentID)
+		return construction{}, fmt.Errorf("agent %q not found or unsupported", req.AgentID)
 	}
 	cfg, err := agentconfig.NormalizeConfig(schemaCfg, f.executablePath)
 	if err != nil {
-		return nil, fmt.Errorf("normalize agent %q: %w", req.AgentID, err)
+		return construction{}, fmt.Errorf("normalize agent %q: %w", req.AgentID, err)
 	}
 	create, ok := constructors[cfg.Type]
 	if !ok {
-		return nil, fmt.Errorf("unsupported agent type %q for agent %q", cfg.Type, req.AgentID)
+		return construction{}, fmt.Errorf("unsupported agent type %q for agent %q", cfg.Type, req.AgentID)
 	}
 
 	mcpServerIDs := cfg.MCPServers
@@ -278,19 +287,27 @@ func (f *Factory) build(ctx context.Context, req BuildRequest) (agent.Agent, err
 
 	resolvedMCP, err := f.resolveMCPServers(req.AgentID, mcpServerIDs)
 	if err != nil {
-		return nil, err
+		return construction{}, err
 	}
 
 	resolvedMCP, err = selectMCPServers(resolvedMCP)
 	if err != nil {
-		return nil, err
+		return construction{}, err
 	}
 
 	ag, err := create(ctx, cfg, req, f, resolvedMCP)
 	if err != nil {
-		return nil, fmt.Errorf("build agent %q: %w", req.AgentID, err)
+		return construction{}, fmt.Errorf("build agent %q: %w", req.AgentID, err)
 	}
-	return ag, nil
+	built := construction{agent: ag}
+	if !withControl {
+		return built, nil
+	}
+	built.control = sessionControlForAgent(ag)
+	if built.control == nil {
+		built.control = hostedControlForConstruction(cfg, req, resolvedMCP, create, f.availabilityIndependentMCP)
+	}
+	return built, nil
 }
 
 // BuildSessionState builds canonical ADK session state for runtime sessions.
