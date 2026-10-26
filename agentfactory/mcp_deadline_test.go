@@ -85,6 +85,13 @@ func TestFactoryAvailabilityIndependentACPConstruction(t *testing.T) {
 	}
 }
 
+type staticMCPToolset struct{ tool tool.Tool }
+
+func (staticMCPToolset) Name() string { return "static" }
+func (s staticMCPToolset) Tools(agent.ReadonlyContext) ([]tool.Tool, error) {
+	return []tool.Tool{s.tool}, nil
+}
+
 // The server can stall both the RPC and its detached cancellation notification.
 // The owner retains exactly one SDK worker until the cancellation tail drains.
 func TestMCPCancellationTailRetainsSlotAndBoundsWaiters(t *testing.T) {
@@ -156,9 +163,15 @@ func TestMCPCancellationTailRetainsSlotAndBoundsWaiters(t *testing.T) {
 	case <-caller.Done():
 		t.Fatal("SDK worker did not drain")
 	}
+	// The slot contract ends when the worker drains. Use an in-memory toolset to
+	// prove the next operation starts without coupling that assertion to the
+	// duration of a second HTTP initialize handshake.
+	bounded.Toolset = staticMCPToolset{tool: &deadlineFixtureTool{run: func(agent.Context) (map[string]any, error) {
+		return nil, nil
+	}}}
 	tools, err := bounded.Tools(lifecycleToolContext{ctx: caller})
 	if err != nil || len(tools) != 1 {
-		t.Fatalf("later fresh attachment=%v,%v", tools, err)
+		t.Fatalf("later fresh operation=%v,%v", tools, err)
 	}
 }
 
@@ -260,7 +273,13 @@ func TestMCPToolBudgetAndProcessorParity(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			bounded := newBoundedMCPToolset(ts, 30*time.Millisecond, 300*time.Millisecond)
+			discovered, err := ts.Tools(lifecycleToolContext{ctx: t.Context()})
+			if err != nil || len(discovered) != 1 {
+				t.Fatalf("discovering fixture tool=%v,%v", discovered, err)
+			}
+			// Discovery deadlines have their own tests. Keep this parity check
+			// independent of the duration of the initial HTTP handshake.
+			bounded := newBoundedMCPToolset(staticMCPToolset{tool: discovered[0]}, 30*time.Millisecond, 300*time.Millisecond)
 			owned.operations = bounded
 			defer func() { _ = owned.Close() }()
 			tools, err := bounded.Tools(lifecycleToolContext{ctx: t.Context()})
@@ -295,7 +314,11 @@ func TestMCPToolBudgetAndProcessorParity(t *testing.T) {
 func TestMCPDiscoveryBudgetIncludesEveryPage(t *testing.T) {
 	peer := mcp.NewServer(&mcp.Implementation{Name: "pages", Version: "1"}, nil)
 	normal := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return peer }, nil)
+	var paging atomic.Bool
 	var pages atomic.Int32
+	blocked := make(chan struct{})
+	drained := make(chan struct{})
+	var blockedOnce, drainedOnce sync.Once
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			normal.ServeHTTP(w, r)
@@ -315,7 +338,17 @@ func TestMCPDiscoveryBudgetIncludesEveryPage(t *testing.T) {
 			normal.ServeHTTP(w, r)
 			return
 		}
-		pages.Add(1)
+		if !paging.Load() {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": msg.ID, "result": map[string]any{"tools": []any{}}})
+			return
+		}
+		if pages.Add(1) > 2 {
+			blockedOnce.Do(func() { close(blocked) })
+			<-r.Context().Done()
+			drainedOnce.Do(func() { close(drained) })
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": msg.ID, "result": map[string]any{"tools": []any{}, "nextCursor": "again"}})
 	}))
@@ -325,14 +358,30 @@ func TestMCPDiscoveryBudgetIncludesEveryPage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	bounded := newBoundedMCPToolset(ts, 40*time.Millisecond, time.Second)
+	// Establish the connection before measuring pagination. The setup budget
+	// must expire the blocked third page, not race the initial HTTP handshake.
+	if tools, err := ts.Tools(lifecycleToolContext{ctx: t.Context()}); err != nil || len(tools) != 0 {
+		t.Fatalf("preparing fixture connection=%v,%v", tools, err)
+	}
+	paging.Store(true)
+	bounded := newBoundedMCPToolset(ts, 500*time.Millisecond, time.Second)
 	owned.operations = bounded
 	defer func() { _ = owned.Close() }()
-	if _, err := bounded.Tools(lifecycleToolContext{ctx: t.Context()}); !errors.Is(err, context.DeadlineExceeded) {
+	caller, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	if _, err := bounded.Tools(lifecycleToolContext{ctx: caller}); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("paging deadline=%v", err)
 	}
-	if pages.Load() < 2 {
-		t.Fatalf("fixture did not paginate: %d", pages.Load())
+	if err := caller.Err(); err != nil {
+		t.Fatalf("discovery consumed caller deadline: %v", err)
+	}
+	if got := pages.Load(); got != 3 {
+		t.Fatalf("fixture requests=%d, want two pages and one blocked request", got)
+	}
+	select {
+	case <-blocked:
+	default:
+		t.Fatal("final page request did not block")
 	}
 	bounded.mu.Lock()
 	done := bounded.pendingDone
@@ -342,10 +391,10 @@ func TestMCPDiscoveryBudgetIncludesEveryPage(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("paging worker did not drain")
 	}
-	before := pages.Load()
-	time.Sleep(50 * time.Millisecond)
-	if pages.Load() != before {
-		t.Fatal("idle paging retry")
+	select {
+	case <-drained:
+	case <-time.After(time.Second):
+		t.Fatal("blocked page request did not drain")
 	}
 }
 
