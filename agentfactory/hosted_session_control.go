@@ -31,7 +31,8 @@ type hostedRecipe struct {
 }
 
 type hostedSessionControl struct {
-	recipe hostedRecipe
+	recipe      hostedRecipe
+	observation *hostedModelObservation
 }
 
 var _ agentproduct.SessionControl = (*hostedSessionControl)(nil)
@@ -67,21 +68,19 @@ func hostedControlForConstruction(
 		resolvedMCP:                cloneMCPServerConfigs(resolvedMCP),
 		create:                     create,
 		availabilityIndependentMCP: availabilityIndependentMCP,
-	}}
+	}, observation: req.hostedObservation}
 }
 
 func (c *hostedSessionControl) Inspect(_ context.Context, sess session.Session) agentproduct.SessionControlSnapshot {
 	if sess == nil {
 		return agentproduct.SessionControlSnapshot{Status: agentproduct.ControlFailed, Reason: agentproduct.ReasonInvalidSession}
 	}
-	return agentproduct.SessionControlSnapshot{
-		Status:       agentproduct.ControlReady,
-		CurrentModel: c.recipe.model,
-		Models: []agentproduct.ModelDescriptor{{
-			ID:    c.recipe.model,
-			Label: c.recipe.model,
-		}},
+	snapshot := agentproduct.SessionControlSnapshot{Status: agentproduct.ControlReady}
+	if c.observation != nil && c.observation.executed(c.recipe.model) {
+		snapshot.CurrentModel = c.recipe.model
+		snapshot.Models = []agentproduct.ModelDescriptor{{ID: c.recipe.model, Label: c.recipe.model}}
 	}
+	return snapshot
 }
 
 func (c *hostedSessionControl) ValidateModel(_ context.Context, sess session.Session, model string) agentproduct.ModelValidation {
@@ -142,6 +141,9 @@ func (r hostedRecipe) buildCandidate(ctx context.Context, model string) (*agentp
 		ReasoningEffort:    r.reasoningEffort,
 	}
 	req := cloneBuildRequest(r.request)
+	modelOverride := model
+	req.ModelOverride = &modelOverride
+	req.hostedObservation = &hostedModelObservation{}
 	resolvedMCP := cloneMCPServerConfigs(r.resolvedMCP)
 	factory := &Factory{availabilityIndependentMCP: r.availabilityIndependentMCP}
 	ag, err := r.create(ctx, cfg, req, factory, resolvedMCP)
@@ -161,7 +163,7 @@ func (r hostedRecipe) buildCandidate(ctx context.Context, model string) (*agentp
 	next.model = model
 	next.request = req
 	next.resolvedMCP = resolvedMCP
-	product, err := agentproduct.New(ag, &hostedSessionControl{recipe: next})
+	product, err := agentproduct.New(ag, &hostedSessionControl{recipe: next, observation: req.hostedObservation})
 	if err != nil {
 		if closer, ok := ag.(io.Closer); ok {
 			_ = closer.Close()
@@ -190,6 +192,7 @@ func cloneBuildRequest(req BuildRequest) BuildRequest {
 	req.MCPServerIDs = append([]string(nil), req.MCPServerIDs...)
 	req.Tools = append([]tool.Tool(nil), req.Tools...)
 	req.Toolsets = append([]tool.Toolset(nil), req.Toolsets...)
+	req.ModelOverride = cloneOptionalString(req.ModelOverride)
 	return req
 }
 

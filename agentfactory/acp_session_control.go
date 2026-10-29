@@ -109,6 +109,7 @@ func mapACPSnapshot(snapshot acpagent.SessionControlSnapshot) agentproduct.Sessi
 	case acpagent.SessionControlAvailable:
 		mapped.Status = agentproduct.ControlReady
 		mapped.CurrentModel = snapshot.CurrentModel
+		mapped.ControlRevision = snapshot.Revision
 		mapped.Models = make([]agentproduct.ModelDescriptor, len(snapshot.Models))
 		for i, model := range snapshot.Models {
 			mapped.Models[i] = agentproduct.ModelDescriptor{ID: model.ID, Label: model.Label}

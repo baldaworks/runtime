@@ -134,8 +134,10 @@ func (c *controlAdmission) close() {
 
 func normalizeSnapshot(got SessionControlSnapshot) SessionControlSnapshot {
 	if !validControlStatus(got.Status) || !validReason(got.Reason) || len(got.Models) > MaxModels ||
-		!validOptionalModelID(got.CurrentModel) || got.Status == ControlReady && got.Reason != ReasonNone ||
-		got.Status != ControlReady && (len(got.Models) != 0 || got.CurrentModel != "" || got.FastForwardSupport) {
+		!validOptionalModelID(got.CurrentModel) || !validOptionalControlRevision(got.ControlRevision) ||
+		got.Status == ControlReady && got.Reason != ReasonNone ||
+		got.Status != ControlReady && (len(got.Models) != 0 || got.CurrentModel != "" ||
+			got.ControlRevision != "" || got.FastForwardSupport) {
 		return SessionControlSnapshot{Status: ControlFailed, Reason: ReasonInvalidResult}
 	}
 	models := make([]ModelDescriptor, len(got.Models))
@@ -195,6 +197,10 @@ func validModelID(value string) bool {
 }
 
 func validOptionalModelID(value string) bool { return value == "" || validModelID(value) }
+
+func validOptionalControlRevision(value string) bool {
+	return value == "" || structuralText(value, MaxControlRevisionBytes)
+}
 
 func validOptionalLabel(value string) bool {
 	return value == "" || structuralText(value, MaxModelLabelBytes)

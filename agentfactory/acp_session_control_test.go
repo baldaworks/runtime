@@ -46,6 +46,7 @@ func TestACPInspectMapping(t *testing.T) {
 			name: "available",
 			input: acpagent.SessionControlSnapshot{
 				Status:       acpagent.SessionControlAvailable,
+				Revision:     "opaque-revision",
 				CurrentModel: testModelID,
 				Models:       []acpagent.SessionModel{{ID: testModelID, Label: "Model A"}},
 			},
@@ -64,7 +65,7 @@ func TestACPInspectMapping(t *testing.T) {
 				t.Fatalf("Inspect = %#v, want status %q reason %q", got, test.status, test.reason)
 			}
 			if test.status == agentproduct.ControlReady {
-				if got.CurrentModel != testModelID || len(got.Models) != 1 || got.Models[0].ID != testModelID || got.FastForwardSupport {
+				if got.CurrentModel != testModelID || got.ControlRevision != "opaque-revision" || len(got.Models) != 1 || got.Models[0].ID != testModelID || got.FastForwardSupport {
 					t.Fatalf("available snapshot = %#v", got)
 				}
 			}

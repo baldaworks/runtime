@@ -206,12 +206,15 @@ func TestSnapshotRejectsContradictoryOrUnsafeEvidence(t *testing.T) {
 	tests := []SessionControlSnapshot{
 		{Status: ControlUnsupported, Models: []ModelDescriptor{{ID: "model"}}},
 		{Status: ControlUnsupported, CurrentModel: "model"},
+		{Status: ControlUnsupported, ControlRevision: "revision"},
 		{Status: ControlUnsupported, FastForwardSupport: true},
 		{Status: ControlReady, Reason: ReasonUnavailable},
 		{Status: ControlReady, Models: []ModelDescriptor{{ID: "same"}, {ID: "same"}}},
 		{Status: ControlReady, Models: []ModelDescriptor{{ID: "one"}}, CurrentModel: "two"},
 		{Status: ControlReady, Models: []ModelDescriptor{{ID: "model\nother"}}},
 		{Status: ControlReady, Models: []ModelDescriptor{{ID: "model", Label: "unsafe\tlabel"}}},
+		{Status: ControlReady, ControlRevision: "unsafe\nrevision"},
+		{Status: ControlReady, ControlRevision: strings.Repeat("r", MaxControlRevisionBytes+1)},
 	}
 	for i, snapshot := range tests {
 		control := &testControl{inspect: func() SessionControlSnapshot { return snapshot }}

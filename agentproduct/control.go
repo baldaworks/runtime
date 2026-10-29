@@ -19,6 +19,8 @@ const (
 	MaxModelIDBytes = 256
 	// MaxModelLabelBytes bounds public model labels.
 	MaxModelLabelBytes = 512
+	// MaxControlRevisionBytes bounds opaque provider control revisions.
+	MaxControlRevisionBytes = 512
 	// MaxContextMessages bounds one portable context package.
 	MaxContextMessages = 256
 	// MaxContextMessageBytes bounds one portable context message.
@@ -94,6 +96,7 @@ type SessionControlSnapshot struct {
 	Status             ControlStatus
 	Models             []ModelDescriptor
 	CurrentModel       string
+	ControlRevision    string
 	FastForwardSupport bool
 	Reason             Reason
 }
