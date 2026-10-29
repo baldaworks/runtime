@@ -149,6 +149,24 @@ callers retain their current Agent ownership behavior. Product cleanup failures
 return the bounded `agentproduct.ErrCloseFailed` sentinel without provider or
 MCP error details.
 
+`BuildRequest.ModelOverride` is an optional per-Product model preference. A nil
+pointer preserves the provider recipe exactly, including an absent recipe
+model. A non-nil value is trimmed and must remain non-empty; it replaces only
+model selection. Blank values and provider families that cannot honor the
+override fail before MCP, client, process, or provider resources are created.
+The factory copies the value. ACP maps it to the semantic Model descriptor via
+`DesiredModel`; hosted OpenAI and AI Studio use it as their local selection.
+`BuildProduct` keeps ACP initialization invocation-lazy, and hosted construction
+does not contact the provider. AI Studio client and credential initialization
+is deferred to its first model execution.
+
+`SessionControlSnapshot.ControlRevision` is an opaque, process-local control
+revision. ACP supplies it with authoritative attached-session observations;
+callers must not parse, order, persist as intent, or transfer it between
+Products. Hosted control reports no active model before the exact Product has
+successfully executed its local model selection, and never labels that local
+evidence as provider-reported state.
+
 For `codex_acp`, `bridge_version` accepts an npm version or dist-tag for
 the canonical [`codex-acp`](https://github.com/baldaworks/codex-acp) package;
 empty defaults to the tested `1.11.0` release. The configuration field keeps
@@ -161,13 +179,15 @@ It runs the agent via `@baldaworks/acprun` (defaulting to pinned `0.1.6`, custom
 `agy_acp` (and compatibility alias `antigravity_acp`) runs the Google Antigravity CLI ACP
 agent (`antigravity-acp`) via `@baldaworks/acprun`.
 
-`model` and `reasoning_effort` are explicit ACP session settings. Runtime applies
+Recipe `model` and `reasoning_effort` are explicit ACP session settings. Runtime applies
 them after `session/new` or `session/resume`, so configured values replace
 conflicting persisted values for the same option IDs. `model_config_id` defaults
 to `model`, and `reasoning_effort_config_id` defaults to `reasoning_effort`.
 Set the exact IDs advertised by a custom ACP server when they differ, for
 example `reasoning_effort_config_id: thought_level`. Omitted settings remain
-session-controlled. This behavior is shared by every ACP-backed provider config.
+session-controlled. A `BuildRequest.ModelOverride` is different: it uses ACP's
+semantic Model category and never guesses a literal option ID. This behavior is
+shared by every ACP-backed provider config.
 
 `claude_acp` is a compatibility alias for `claude_code_acp`. Both use the same
 `claude_code_acp` configuration block.

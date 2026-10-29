@@ -15,7 +15,9 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"google.golang.org/adk/v2/agent"
 	"google.golang.org/adk/v2/model"
+	"google.golang.org/adk/v2/runner"
 	"google.golang.org/adk/v2/session"
+	"google.golang.org/genai"
 )
 
 const (
@@ -75,7 +77,7 @@ func TestHostedBuildProductValidationAndIndependentReplacement(t *testing.T) {
 
 			sess := newHostedControlSession(t)
 			snapshot := product.Control.Inspect(t.Context(), sess)
-			if snapshot.Status != agentproduct.ControlReady || snapshot.CurrentModel != hostedOldModel {
+			if snapshot.Status != agentproduct.ControlReady || snapshot.CurrentModel != "" || len(snapshot.Models) != 0 {
 				t.Fatalf("Inspect = %#v", snapshot)
 			}
 			validation := product.Control.ValidateModel(t.Context(), sess, hostedNewModel)
@@ -99,7 +101,7 @@ func TestHostedBuildProductValidationAndIndependentReplacement(t *testing.T) {
 				t.Fatalf("candidate recipe was not independent: model:%d endpoints:%v", modelBuilds, endpoints)
 			}
 			candidateSnapshot := candidate.Control.Inspect(t.Context(), sess)
-			if candidateSnapshot.Status != agentproduct.ControlReady || candidateSnapshot.CurrentModel != hostedNewModel {
+			if candidateSnapshot.Status != agentproduct.ControlReady || candidateSnapshot.CurrentModel != "" || len(candidateSnapshot.Models) != 0 {
 				t.Fatalf("candidate Inspect = %#v", candidateSnapshot)
 			}
 			if err := candidate.Close(); err != nil {
@@ -112,6 +114,89 @@ func TestHostedBuildProductValidationAndIndependentReplacement(t *testing.T) {
 				t.Fatalf("candidate close affected incumbent: %#v", got)
 			}
 		})
+	}
+}
+
+func TestHostedInspectReportsOnlySuccessfulExactProductExecution(t *testing.T) {
+	observation := &hostedModelObservation{}
+	control := &hostedSessionControl{
+		recipe:      hostedRecipe{model: hostedOldModel},
+		observation: observation,
+	}
+	sess := newHostedControlSession(t)
+	if got := control.Inspect(t.Context(), sess); got.CurrentModel != "" || len(got.Models) != 0 {
+		t.Fatalf("Inspect before execution = %#v", got)
+	}
+
+	failed := observeHostedModel(errorHostedModel{name: hostedOldModel}, hostedOldModel, observation)
+	sawFailure := false
+	for _, err := range failed.GenerateContent(t.Context(), nil, false) {
+		if err != nil {
+			sawFailure = true
+		}
+	}
+	if !sawFailure {
+		t.Fatal("failed model returned no error")
+	}
+	if got := control.Inspect(t.Context(), sess); got.CurrentModel != "" {
+		t.Fatalf("Inspect after failed execution = %#v", got)
+	}
+
+	succeeded := observeHostedModel(successHostedModel{name: hostedOldModel}, hostedOldModel, observation)
+	for _, err := range succeeded.GenerateContent(t.Context(), nil, false) {
+		if err != nil {
+			t.Fatalf("successful model: %v", err)
+		}
+	}
+	got := control.Inspect(t.Context(), sess)
+	if got.CurrentModel != hostedOldModel || len(got.Models) != 1 || got.ControlRevision != "" {
+		t.Fatalf("Inspect after successful local execution = %#v", got)
+	}
+
+	replacement := &hostedSessionControl{
+		recipe:      hostedRecipe{model: hostedOldModel},
+		observation: &hostedModelObservation{},
+	}
+	if got := replacement.Inspect(t.Context(), sess); got.CurrentModel != "" {
+		t.Fatalf("replacement inherited incumbent observation = %#v", got)
+	}
+}
+
+func TestHostedProductRunnerPublishesLocalExecutionObservation(t *testing.T) {
+	original := newOpenAIModel
+	t.Cleanup(func() { newOpenAIModel = original })
+	newOpenAIModel = func(_ string, name string, _ time.Duration, _ string) (model.LLM, error) {
+		return successHostedModel{name: name}, nil
+	}
+	factory := New(map[string]agentconfig.Config{
+		"hosted": {Type: agentconfig.AgentTypeOpenAI, OpenAI: &agentconfig.LocalAPIConfig{APIKey: "key", Model: hostedOldModel}},
+	}, mcpregistry.New(nil))
+	product, err := factory.BuildProduct(t.Context(), BuildRequest{AgentID: "hosted", WorkingDirectory: t.TempDir()})
+	if err != nil {
+		t.Fatalf("BuildProduct: %v", err)
+	}
+	defer func() { _ = product.Close() }()
+
+	service := session.InMemoryService()
+	created, err := service.Create(t.Context(), &session.CreateRequest{AppName: "hosted", UserID: "user"})
+	if err != nil {
+		t.Fatalf("Create session: %v", err)
+	}
+	if got := product.Control.Inspect(t.Context(), created.Session); got.CurrentModel != "" {
+		t.Fatalf("Inspect before runner execution = %#v", got)
+	}
+	run, err := runner.New(runner.Config{AppName: "hosted", Agent: product.Agent, SessionService: service})
+	if err != nil {
+		t.Fatalf("runner.New: %v", err)
+	}
+	for _, runErr := range run.Run(t.Context(), "user", created.Session.ID(), genai.NewContentFromText("hello", genai.RoleUser), agent.RunConfig{}) {
+		if runErr != nil {
+			t.Fatalf("runner.Run: %v", runErr)
+		}
+	}
+	got := product.Control.Inspect(t.Context(), created.Session)
+	if got.CurrentModel != hostedOldModel || len(got.Models) != 1 {
+		t.Fatalf("Inspect after runner execution = %#v", got)
 	}
 }
 

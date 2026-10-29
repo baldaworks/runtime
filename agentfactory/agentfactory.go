@@ -50,11 +50,25 @@ type BuildRequest struct {
 	MCPServerIDs []string `json:"mcp_server_ids,omitempty"`
 	// OutputKey stores the final visible model output in session state for this invocation.
 	OutputKey string `json:"output_key,omitempty"`
+	// ModelOverride replaces only the provider recipe's model selection. Nil
+	// preserves the recipe exactly; a non-nil blank value is invalid.
+	ModelOverride *string `json:"model_override,omitempty"`
 	// Tools contains ADK-native tools supplied by the caller for this build.
 	Tools []tool.Tool `json:"-"`
 	// Toolsets contains ADK-native toolsets supplied by the caller for this build.
 	Toolsets []tool.Toolset `json:"-"`
+
+	hostedObservation *hostedModelObservation
+	deferProviderInit bool
 }
+
+var (
+	// ErrInvalidModelOverride reports an explicitly blank model override.
+	ErrInvalidModelOverride = errors.New("invalid model override")
+	// ErrModelOverrideUnsupported reports a provider family that cannot honor
+	// a model override without silently changing its recipe semantics.
+	ErrModelOverrideUnsupported = errors.New("model override unsupported")
+)
 
 var buildRequestValidator = newBuildRequestValidator()
 
@@ -264,6 +278,13 @@ func (f *Factory) build(ctx context.Context, req BuildRequest, withControl bool)
 	if err := req.Validate(); err != nil {
 		return construction{}, err
 	}
+	if req.ModelOverride != nil {
+		override := strings.TrimSpace(*req.ModelOverride)
+		if override == "" {
+			return construction{}, ErrInvalidModelOverride
+		}
+		req.ModelOverride = &override
+	}
 	req.AgentID = strings.TrimSpace(req.AgentID)
 	req.WorkingDirectory = strings.TrimSpace(req.WorkingDirectory)
 
@@ -278,6 +299,16 @@ func (f *Factory) build(ctx context.Context, req BuildRequest, withControl bool)
 	create, ok := constructors[cfg.Type]
 	if !ok {
 		return construction{}, fmt.Errorf("unsupported agent type %q for agent %q", cfg.Type, req.AgentID)
+	}
+	if req.ModelOverride != nil && cfg.Type != agentconfig.AgentTypeGenericACP &&
+		cfg.Type != agentconfig.AgentTypeOpenAI && cfg.Type != agentconfig.AgentTypeAIStudio {
+		return construction{}, ErrModelOverrideUnsupported
+	}
+	if withControl && (cfg.Type == agentconfig.AgentTypeOpenAI || cfg.Type == agentconfig.AgentTypeAIStudio) {
+		req.hostedObservation = &hostedModelObservation{}
+	}
+	if withControl && cfg.Type == agentconfig.AgentTypeGenericACP {
+		req.deferProviderInit = true
 	}
 
 	mcpServerIDs := cfg.MCPServers
@@ -305,7 +336,12 @@ func (f *Factory) build(ctx context.Context, req BuildRequest, withControl bool)
 	}
 	built.control = sessionControlForAgent(ag)
 	if built.control == nil {
-		built.control = hostedControlForConstruction(cfg, req, resolvedMCP, create, f.availabilityIndependentMCP)
+		controlCfg := cfg
+		controlCfg.Model = constructionModel(req, cfg)
+		controlReq := cloneBuildRequest(req)
+		controlReq.Name = effectiveName(req)
+		controlReq.Description = effectiveDescription(req, cfg)
+		built.control = hostedControlForConstruction(controlCfg, controlReq, resolvedMCP, create, f.availabilityIndependentMCP)
 	}
 	return built, nil
 }
@@ -752,13 +788,14 @@ var acpConstructor = func(ctx context.Context, cfg agentconfig.ResolvedConfig, r
 	}
 	return newACPAgent(acpagent.Config{
 		Context:            ctx,
-		LazyInitialization: f.availabilityIndependentMCP,
+		LazyInitialization: f.availabilityIndependentMCP || req.deferProviderInit,
 		SetupTimeout:       setupTimeout,
 		InitializeTimeout:  f.acpInitializeTimeout,
 
 		Name:              effectiveName(req),
 		Description:       effectiveDescription(req, cfg),
-		SessionConfig:     acpSessionConfigValues(cfg.Model, cfg.ModelConfigID, reasoningEffort, cfg.ReasoningEffortConfigID, cfg.Mode),
+		SessionConfig:     acpSessionConfigValues(acpRecipeModel(req, cfg), cfg.ModelConfigID, reasoningEffort, cfg.ReasoningEffortConfigID, cfg.Mode),
+		DesiredModel:      cloneOptionalString(req.ModelOverride),
 		Instruction:       effectiveInstruction(req, cfg),
 		GlobalInstruction: effectiveGlobalInstruction(req),
 		Command:           append([]string(nil), cfg.Command...),
@@ -771,6 +808,28 @@ var acpConstructor = func(ctx context.Context, cfg agentconfig.ResolvedConfig, r
 		MCPServers:        toRuntimeMCPServers(resolvedMCP),
 		OutputKey:         strings.TrimSpace(req.OutputKey),
 	})
+}
+
+func acpRecipeModel(req BuildRequest, cfg agentconfig.ResolvedConfig) string {
+	if req.ModelOverride != nil {
+		return ""
+	}
+	return cfg.Model
+}
+
+func constructionModel(req BuildRequest, cfg agentconfig.ResolvedConfig) string {
+	if req.ModelOverride != nil {
+		return *req.ModelOverride
+	}
+	return cfg.Model
+}
+
+func cloneOptionalString(value *string) *string {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
 }
 
 func acpSessionConfigValues(modelName, modelConfigID, reasoningEffort, reasoningEffortConfigID, mode string) []acpagent.SessionConfigValue {
@@ -823,11 +882,13 @@ var openAIConstructor = func(ctx context.Context, cfg agentconfig.ResolvedConfig
 	if cfg.Type != agentconfig.AgentTypeOpenAI {
 		return nil, fmt.Errorf("unknown openai agent type %q", cfg.Type)
 	}
-	llmModel, err := newOpenAIModel(cfg.APIKey, cfg.Model, cfg.Timeout, cfg.ReasoningEffort)
+	modelName := constructionModel(req, cfg)
+	llmModel, err := newOpenAIModel(cfg.APIKey, modelName, cfg.Timeout, cfg.ReasoningEffort)
 	if err != nil {
 		return nil, err
 	}
 
+	llmModel = observeHostedModel(llmModel, modelName, req.hostedObservation)
 	return buildHostedAgent(hostedagent.Config{
 		Name:              effectiveName(req),
 		Description:       effectiveDescription(req, cfg),
@@ -843,11 +904,13 @@ var aistudioConstructor = func(ctx context.Context, cfg agentconfig.ResolvedConf
 	if cfg.Type != agentconfig.AgentTypeAIStudio {
 		return nil, fmt.Errorf("unknown aistudio agent type %q", cfg.Type)
 	}
-	llmModel, err := newAIStudioModel(ctx, cfg.APIKey, cfg.Model)
+	modelName := constructionModel(req, cfg)
+	llmModel, err := newAIStudioModel(ctx, cfg.APIKey, modelName)
 	if err != nil {
 		return nil, err
 	}
 
+	llmModel = observeHostedModel(llmModel, modelName, req.hostedObservation)
 	return buildHostedAgent(hostedagent.Config{
 		Name:              effectiveName(req),
 		Description:       effectiveDescription(req, cfg),
